@@ -1,16 +1,19 @@
 use std::collections::HashMap;
+use std::io::{Seek, BufRead};
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::Fields;
 use arrow_schema::Schema;
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, BytesMut, Buf};
 use error::ErrorKind;
 
 pub mod encoders;
 pub mod error;
 pub mod pg_schema;
+pub mod decoders;
 
 use crate::encoders::{BuildEncoder, Encode, EncoderBuilder};
+use crate::decoders::{Decoder, ConsumableBuf};
 use crate::pg_schema::PostgresSchema;
 
 const HEADER_MAGIC_BYTES: &[u8] = b"PGCOPY\n\xff\r\n\0";
@@ -149,6 +152,259 @@ impl ArrowToPostgresBinaryEncoder {
         Ok(())
     }
 }
+
+enum BatchDecodeResult {
+    Batch(RecordBatch),
+    Incomplete,
+    Error(ErrorKind),
+    PartialConsume{batch: RecordBatch, consumed: usize},
+}
+
+pub struct PostgresBinaryToArrowDecoder<R> {
+    schema: PostgresSchema,
+    decoders: Vec<Decoder>,
+    source: R,
+    state: EncoderState,
+    capacity: usize,
+}
+
+impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
+    pub fn new(schema: PostgresSchema, source: R, capacity: usize) -> Result<Self, ErrorKind> {
+        let decoders = Decoder::new(&schema);
+        Ok(PostgresBinaryToArrowDecoder {
+            schema,
+            decoders,
+            source,
+            state: EncoderState::Created,
+            capacity,
+        })
+    }
+
+    pub fn read_header(&mut self) -> Result<(), ErrorKind> {
+        assert_eq!(self.state, EncoderState::Created);
+        let mut header = [0; 11];
+        self.source.read_exact(&mut header)?;
+        if header != HEADER_MAGIC_BYTES {
+            return Err(ErrorKind::InvalidBinaryHeader { bytes: header });
+        }
+        let mut flags = [0; 4];
+        self.source.read_exact(&mut flags)?;
+        let mut header_extension = [0; 4];
+        self.source.read_exact(&mut header_extension)?;
+        self.state = EncoderState::Encoding;
+        Ok(())
+    }
+
+    pub fn decode_batches(
+        &mut self,
+    ) -> Result<Vec<RecordBatch>, ErrorKind> {
+        let mut batches = Vec::new();
+        let mut buf = BytesMut::with_capacity(self.capacity);
+        let mut eof = false;
+        while self.state == EncoderState::Encoding {
+            // Read loop. Read from source until buf is full.
+            let mut data = self.source.fill_buf()?;
+            loop {
+                // If there is no data left in the source, break the loop and finish the batch.
+                // set the eof flag to true to indicate that the source has been fully read.
+                if data.is_empty() {
+                    eof = true;
+                    break;
+                // if data was read from the source, put it into the buffer and single
+                // to source that we have consumed the data by calling BufRead::consume.
+                } else {
+                    buf.put(data);
+                    let read = data.len();
+                    self.source.consume(read);
+                }
+                data = self.source.fill_buf()?;
+
+                // If the remaining capacity of the buffer is less than the length of the data,
+                // break the loop.
+                let remaining = buf.capacity() - buf.len();
+                if remaining < data.len() {
+                    break;
+                }
+            }
+
+            // If the eof flag is not set and there remains capacity in the buffer, read the
+            // ${remaining_capacity} bytes from the source and put them into the buffer.
+            let remaining = buf.capacity() - buf.len();
+            if !eof && remaining > 0 {
+                let read = std::cmp::min(data.len(), buf.remaining());
+                buf.put(&data[..read]);
+                self.source.consume(read);
+            }
+
+            // If we have reached the end of the source decode the batch and return error if
+            // there is any remaining data in the buffer indicated by and IncompleteDecode
+            // or PartialConsume BatchDecodeResult.
+            if eof {
+                if !buf.is_empty() {
+                    match self.decode_batch(&mut buf) {
+                        BatchDecodeResult::Batch(batch) => batches.push(batch),
+                        BatchDecodeResult::Incomplete => {
+                            return Err(ErrorKind::IncompleteDecode {
+                                remaining_bytes: buf.to_vec(),
+                            })
+                        }
+                        BatchDecodeResult::Error(e) => return Err(e),
+                        BatchDecodeResult::PartialConsume{ batch: _, consumed: _} => {
+                            return Err(ErrorKind::ExtraDataFound)
+                        }
+                    }
+                }
+                self.state = EncoderState::Finished;
+            // If we have not reached the end of the source, decode the batch.
+            } else {
+                match self.decode_batch(&mut buf) {
+                    BatchDecodeResult::Batch(batch) => {
+                        batches.push(batch);
+                        buf.clear()
+                    },
+                    // If we receive a PartialConsume BatchDecodeResult, store the batches we did
+                    // manage to decode and continue reading from the source with the remaining
+                    // data from the previous read in the buffer.
+                    BatchDecodeResult::PartialConsume{ batch, consumed } => {
+                        batches.push(batch);
+                        let old_buf = buf;
+                        buf = BytesMut::with_capacity(self.capacity);
+                        buf.put(&old_buf[consumed..]);
+                    },
+                    // If we receive an Incomplete BatchDecodeResult, increase the capacity of the
+                    // buffer reading more data from the source and try to decode the batch again.
+                    BatchDecodeResult::Incomplete => {
+                        // println!("Increasing capacity to {}", self.capacity * 2);
+                        // increase the capacity attribute of the decoder by a factor of 2.
+                        self.capacity *= 2;
+                        let old_buf = buf;
+                        // create a new buffer with the new capacity.
+                        buf = BytesMut::with_capacity(self.capacity);
+                        // put all the data from the old buffer into the new buffer.
+                        buf.put(old_buf);
+                    }
+                    BatchDecodeResult::Error(e) => return Err(e),
+                }
+            }
+        }
+        Ok(batches)
+    }
+
+    fn decode_batch(&mut self, buf: &mut BytesMut) -> BatchDecodeResult {
+        // ensure that the decoder is in the correct state befpre proceeding.
+        assert_eq!(self.state, EncoderState::Encoding);
+
+        // create a new ConsumableBuf from the buffer.
+        let mut local_buf = ConsumableBuf::new(buf);
+        // Keep track of the number of rows in the batch.
+        let mut rows = 0;
+
+        // Each iteration of the loop reads a tuple from the data.
+        // If we are not able to read a tuple, return a BatchDecodeResult::Incomplete.
+        // If we were able to read some tuples, but not all the data in the buffer was consumed,
+        // return a BatchDecodeResult::PartialConsume.
+        while local_buf.remaining() > 0 {
+            // Store the number of bytes consumed before reading the tuple.
+            let consumed = local_buf.consumed();
+
+            // Read the number of columns in the tuple. This number is
+            // stored as a 16-bit integer. This value is the same for all
+            // tuples in the batch.
+            let tuple_len: u16 = match local_buf.consume_into_u16() {
+                Ok(len) => len,
+                Err(e) => {
+                    println!("Error reading tuple length: {:?}", e);
+                    return BatchDecodeResult::Error(e);
+                }
+            };
+
+            // If the tuple length is 0xffff we have reached the end of the
+            // snapshot and we can break the loop and finish the batch.
+            if tuple_len == 0xffff {
+                break
+            }
+
+            // Each iteration of the loop reads a column from the tuple using the
+            // decoder specfied via the schema.
+            for decoder in self.decoders.iter_mut() {
+                // If local_buf has been fully consumed and we have not read any rows,
+                // return a BatchDecodeResult::Incomplete.
+                if local_buf.remaining() == 0 && rows == 0 {
+                    // println!("Incomplete no data remaining");
+                    return BatchDecodeResult::Incomplete;
+                // If local_buf has been fully consumed and we have read some rows,
+                // return a BatchDecodeResult::PartialConsume, passing the number of bytes
+                // consumed before reading the tuple to the caller so it can know how much data
+                // was consumed.
+                } else if local_buf.remaining() == 0 {
+                    // println!("Partial consume no data remaining");
+                    // println!("Finishing batch. Rows: {}", rows);
+                    return match self.finish_batch() {
+                        Ok(batch) => BatchDecodeResult::PartialConsume{ batch, consumed},
+                        Err(e) => BatchDecodeResult::Error(e),
+                    }
+                }
+                // Apply the decoder to the local_buf. Cosume the data from the buffer as needed
+                match decoder.apply(&mut local_buf) {
+                    // If the decoder was able to decode the data, continue to the next column.
+                    Ok(_) => {}
+                    // If we receive a DataSize error, we have reached the end of the data in
+                    // the buffer. If we have not finished the current tuple
+                    Err(ErrorKind::DataSize { found: _, expected: _ }) => {
+                        // If we have not read any rows, return a BatchDecodeResult::Incomplete.
+                        if rows == 0 {
+                            // println!("Incomplete mid-batch");
+                            return BatchDecodeResult::Incomplete;
+                        } else {
+                            // If we have read some rows, return a BatchDecodeResult::PartialConsume,
+                            // println!("Partial consume mid-batch");
+                            // println!("Finishing batch. Rows: {}", rows);
+                            return match self.finish_batch() {
+                                Ok(batch) => BatchDecodeResult::PartialConsume{ batch, consumed},
+                                Err(e) => BatchDecodeResult::Error(e),
+                            }
+                        }
+                    },
+                    Err(e) => return BatchDecodeResult::Error(e)
+                }
+            }
+            // Increment the number of rows in the batch.
+            rows += 1;
+        }
+
+        // println!("Finishing batch. Rows: {}", rows);
+        // Finish the batch and return the result.
+        match self.finish_batch() {
+            Ok(batch) => BatchDecodeResult::Batch(batch),
+            Err(e) => BatchDecodeResult::Error(e),
+        }
+
+    }
+
+    fn finish_batch(
+        &mut self,
+    ) -> Result<RecordBatch, ErrorKind> {
+        let mut columns: Vec<std::sync::Arc<dyn Array>> = Vec::new();
+        // Find the mininum length column in the decoders. These can be different if
+        // we are in a partial consume state. We will truncate the columns to the length
+        // of the shortest column and pick up the lost data in the next batch.
+        let column_len = self.decoders.iter().map(|d| d.column_len()).min().unwrap();
+        // For each decoder call its finish method to coerce the data into an Arrow array.
+        // and append the array to the columns vector.
+        for decoder in self.decoders.iter_mut() {
+            match decoder.finish(column_len) {
+                Ok(array) => columns.push(array),
+                Err(e) => return Err(e)
+            }
+        }
+        // Create a new RecordBatch from the columns vector and return it.
+        let record_batch =
+            RecordBatch::try_new(self.schema.clone().into(), columns)?;
+
+        Ok(record_batch)
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
