@@ -1,4 +1,4 @@
-use arrow_schema::{DataType, ArrowError};
+use arrow_schema::{ArrowError, DataType};
 use thiserror::Error;
 
 use crate::pg_schema::PostgresType;
@@ -46,17 +46,13 @@ pub enum ErrorKind {
     Decode { reason: String, name: String },
     #[error("Got invalid binary file header {bytes:?}")]
     InvalidBinaryHeader { bytes: [u8; 11] },
-    #[error("Got invalid binary file trailer {bytes:?}")]
-    InvalidBinaryTrailer { bytes: [u8; 2] },
-    #[error("Reached EOF before with incomplete data. Extra data: {remaining_bytes:?}")]
+    #[error("Reached EOF in the middle of a tuple. partial tuple: {remaining_bytes:?}")]
     IncompleteDecode { remaining_bytes: Vec<u8> },
-    #[error("Got data of the wrong size: got: {found}, expected: {expected}")]
-    DataSize { found: usize, expected: usize },
+    #[error("Expected data size was not found")]
+    IncompleteData,
     #[error("Invalid column specification: {spec}")]
     InvalidColumnSpec { spec: String },
-    #[error("Extra data found at the end of the file")]
-    ExtraDataFound,
-    #[error("Invalid column type: {typ}")]
+    #[error("Invalid column type found while parsing schema: {typ}")]
     UnsupportedColumnType { typ: String },
     #[error("Got an error in an IO Operation: {io_error:?}")]
     IOError { io_error: std::io::Error },

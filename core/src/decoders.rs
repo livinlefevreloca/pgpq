@@ -1,51 +1,44 @@
 #![allow(clippy::redundant_closure_call)]
 
-use arrow_array::{self, ArrayRef};
-use std::fmt::Debug;
-use std::sync::Arc;
 use crate::encoders::{PG_BASE_DATE_OFFSET, PG_BASE_TIMESTAMP_OFFSET_US};
-use arrow_array::types::GenericBinaryType;
 use arrow_array::builder::GenericByteBuilder;
+use arrow_array::types::GenericBinaryType;
+use arrow_array::{self, ArrayRef};
 use arrow_array::{
     BooleanArray, Date32Array, DurationMicrosecondArray, Float32Array, Float64Array,
-    GenericStringArray, Int16Array, Int32Array, Int64Array,
-    Time64MicrosecondArray, TimestampMicrosecondArray
+    GenericStringArray, Int16Array, Int32Array, Int64Array, Time64MicrosecondArray,
+    TimestampMicrosecondArray,
 };
+use std::fmt::Debug;
+use std::sync::Arc;
 
 use crate::error::ErrorKind;
 use crate::pg_schema::{PostgresSchema, PostgresType};
 
-pub(crate) struct ConsumableBuf<'a> {
+pub(crate) struct BufferView<'a> {
     inner: &'a [u8],
     consumed: usize,
 }
 
-impl Debug for ConsumableBuf<'_> {
+impl Debug for BufferView<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", &self.inner[self.consumed..])
     }
 }
 
-// const used for stringifying postgres decimals
-const DEC_DIGITS: i16 = 4;
-// const used for determining sign of numeric
-const NUMERIC_NEG: i16 = 0x4000;
-
-impl ConsumableBuf<'_> {
-    pub fn new(inner: &'_ [u8]) -> ConsumableBuf<'_> {
-        ConsumableBuf { inner, consumed: 0 }
+impl BufferView<'_> {
+    pub fn new(inner: &'_ [u8]) -> BufferView<'_> {
+        BufferView { inner, consumed: 0 }
     }
 
     pub fn consume_into_u32(&mut self) -> Result<u32, ErrorKind> {
         if self.consumed + 4 > self.inner.len() {
-            return Err(ErrorKind::DataSize {
-                found: self.inner.len() - self.consumed,
-                expected: 4,
-            });
+            return Err(ErrorKind::IncompleteData);
         }
         let res = u32::from_be_bytes(
             self.inner[self.consumed..self.consumed + 4]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         self.consumed += 4;
         Ok(res)
@@ -53,14 +46,12 @@ impl ConsumableBuf<'_> {
 
     pub fn consume_into_u16(&mut self) -> Result<u16, ErrorKind> {
         if self.consumed + 2 > self.inner.len() {
-            return Err(ErrorKind::DataSize {
-                found: self.inner.len() - self.consumed,
-                expected: 2,
-            });
+            return Err(ErrorKind::IncompleteData);
         }
         let res = u16::from_be_bytes(
             self.inner[self.consumed..self.consumed + 2]
-                .try_into().unwrap()
+                .try_into()
+                .unwrap(),
         );
         self.consumed += 2;
         Ok(res)
@@ -68,18 +59,12 @@ impl ConsumableBuf<'_> {
 
     pub fn consume_into_vec_n(&mut self, n: usize) -> Result<Vec<u8>, ErrorKind> {
         if self.consumed + n > self.inner.len() {
-            return Err(ErrorKind::DataSize {
-                found: self.inner.len() - self.consumed,
-                expected: n,
-            });
+            return Err(ErrorKind::IncompleteData);
         }
         let data = self.inner[self.consumed..self.consumed + n].to_vec();
         self.consumed += n;
         if data.len() != n {
-            return Err(ErrorKind::DataSize {
-                found: data.len(),
-                expected: n,
-            });
+            return Err(ErrorKind::IncompleteData);
         }
         Ok(data)
     }
@@ -98,28 +83,24 @@ impl ConsumableBuf<'_> {
 }
 
 pub(crate) trait Decode {
-    fn decode(&mut self, buf: &mut ConsumableBuf) -> Result<(), ErrorKind>;
-    fn finish(&mut self, column_len: usize) -> Result<ArrayRef, ErrorKind>;
+    fn decode(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind>;
+    fn finish(&mut self, column_len: usize) -> ArrayRef;
     fn column_len(&self) -> usize;
-    fn name(&self) -> &str;
+    fn name(&self) -> String;
 }
 
 macro_rules! impl_decode {
     ($struct_name:ident, $size:expr, $transform:expr, $array_kind:ident) => {
         impl Decode for $struct_name {
-            fn decode(&mut self, buf: &mut ConsumableBuf<'_>) -> Result<(), ErrorKind> {
+            fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
                 let field_size = buf.consume_into_u32()?;
                 if field_size == u32::MAX {
                     self.arr.push(None);
                     return Ok(());
                 }
                 if field_size != $size {
-                    return Err(ErrorKind::DataSize {
-                        found: field_size as usize,
-                        expected: $size,
-                    });
+                    return Err(ErrorKind::IncompleteData);
                 }
-
 
                 let data = buf.consume_into_vec_n(field_size as usize)?;
                 // Unwrap is safe here because have checked the field size is the expected size
@@ -131,19 +112,19 @@ macro_rules! impl_decode {
                 Ok(())
             }
 
-            fn name(&self) -> &str {
-                &self.name
-            }
-
             fn column_len(&self) -> usize {
                 self.arr.len()
             }
 
-            fn finish(&mut self, column_len: usize) -> Result<ArrayRef, ErrorKind> {
+            fn name(&self) -> String {
+                self.name.to_string()
+            }
+
+            fn finish(&mut self, column_len: usize) -> ArrayRef {
                 let mut data = std::mem::take(&mut self.arr);
                 data.resize(column_len, None);
                 let array = Arc::new($array_kind::from(data));
-                Ok(array as ArrayRef)
+                array as ArrayRef
             }
         }
     };
@@ -152,7 +133,7 @@ macro_rules! impl_decode {
 macro_rules! impl_decode_fallible {
     ($struct_name:ident, $size:expr, $transform:expr, $array_kind:ident) => {
         impl Decode for $struct_name {
-            fn decode(&mut self, buf: &mut ConsumableBuf<'_>) -> Result<(), ErrorKind> {
+            fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
                 let field_size = buf.consume_into_u32()?;
 
                 if field_size == u32::MAX {
@@ -161,10 +142,7 @@ macro_rules! impl_decode_fallible {
                 }
 
                 if field_size != $size {
-                    return Err(ErrorKind::DataSize {
-                        found: field_size as usize,
-                        expected: $size,
-                    });
+                    return Err(ErrorKind::IncompleteData);
                 }
 
                 let data = buf.consume_into_vec_n(field_size as usize)?;
@@ -189,19 +167,19 @@ macro_rules! impl_decode_fallible {
                 Ok(())
             }
 
-            fn name(&self) -> &str {
-                &self.name
-            }
-
             fn column_len(&self) -> usize {
                 self.arr.len()
             }
 
-            fn finish(&mut self, column_len: usize) -> Result<ArrayRef, ErrorKind> {
+            fn name(&self) -> String {
+                self.name.to_string()
+            }
+
+            fn finish(&mut self, column_len: usize) -> ArrayRef {
                 let mut data = std::mem::take(&mut self.arr);
                 data.resize(column_len, None);
                 let array = Arc::new($array_kind::from(data));
-                Ok(array as ArrayRef)
+                array as ArrayRef
             }
         }
     };
@@ -210,7 +188,7 @@ macro_rules! impl_decode_fallible {
 macro_rules! impl_decode_variable_size {
     ($struct_name:ident, $transform:expr, $extra_bytes:expr, $array_kind:ident, $offset_size:ident) => {
         impl Decode for $struct_name {
-            fn decode(&mut self, buf: &mut ConsumableBuf<'_>) -> Result<(), ErrorKind> {
+            fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
                 let field_size = buf.consume_into_u32()?;
                 if field_size == u32::MAX {
                     self.arr.push(None);
@@ -218,10 +196,7 @@ macro_rules! impl_decode_variable_size {
                 }
 
                 if field_size > buf.remaining() as u32 {
-                    return Err(ErrorKind::DataSize {
-                        found: buf.remaining() as usize,
-                        expected: field_size as usize,
-                    });
+                    return Err(ErrorKind::IncompleteData);
                 }
 
                 // Consume and any extra data that is not part of the field
@@ -251,24 +226,25 @@ macro_rules! impl_decode_variable_size {
                 Ok(())
             }
 
-            fn name(&self) -> &str {
-                &self.name
-            }
-
             fn column_len(&self) -> usize {
                 self.arr.len()
             }
 
-            fn finish(&mut self, column_len: usize) -> Result<ArrayRef, ErrorKind> {
+            fn name(&self) -> String {
+                self.name.to_string()
+            }
+
+            fn finish(&mut self, column_len: usize) -> ArrayRef {
                 let mut data = std::mem::take(&mut self.arr);
                 data.resize(column_len, None);
                 let array = Arc::new($array_kind::<$offset_size>::from(data));
-                Ok(array as ArrayRef)
+                array as ArrayRef
             }
         }
     };
 }
 
+#[allow(dead_code)]
 pub struct BooleanDecoder {
     name: String,
     arr: Vec<Option<bool>>,
@@ -340,6 +316,50 @@ impl_decode_fallible!(
     },
     TimestampMicrosecondArray
 );
+
+pub struct TimestampTzMicrosecondDecoder {
+    name: String,
+    arr: Vec<Option<i64>>,
+    timezone: String,
+}
+
+impl Decode for TimestampTzMicrosecondDecoder {
+    fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
+        let field_size = buf.consume_into_u32()?;
+        if field_size == u32::MAX {
+            self.arr.push(None);
+            return Ok(());
+        }
+
+        if field_size != 8 {
+            return Err(ErrorKind::IncompleteData);
+        }
+
+        let data = buf.consume_into_vec_n(field_size as usize)?;
+        let timestamp_us = i64::from_be_bytes(data.try_into().unwrap());
+        let timestamp_us = convert_pg_timestamp_to_arrow_timestamp_microseconds(timestamp_us)?;
+        self.arr.push(Some(timestamp_us));
+
+        Ok(())
+    }
+
+    fn column_len(&self) -> usize {
+        self.arr.len()
+    }
+
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn finish(&mut self, column_len: usize) -> ArrayRef {
+        let mut data = std::mem::take(&mut self.arr);
+        data.resize(column_len, None);
+        let array = Arc::new(
+            TimestampMicrosecondArray::from(data).with_timezone(self.timezone.to_string()),
+        );
+        array as ArrayRef
+    }
+}
 
 /// Convert Postgres dates (days since 2000-01-01) to Arrow dates (days since 1970-01-01)
 #[inline(always)]
@@ -453,7 +473,7 @@ pub struct BinaryDecoder {
 }
 
 impl Decode for BinaryDecoder {
-    fn decode(&mut self, buf: &mut ConsumableBuf<'_>) -> Result<(), ErrorKind> {
+    fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
         let field_size = buf.consume_into_u32()?;
         if field_size == u32::MAX {
             self.arr.push(None);
@@ -466,27 +486,26 @@ impl Decode for BinaryDecoder {
         Ok(())
     }
 
-    fn name(&self) -> &str {
-        &self.name
-    }
-
     fn column_len(&self) -> usize {
         self.arr.len()
     }
 
-    fn finish(&mut self, column_len: usize) -> Result<ArrayRef, ErrorKind> {
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn finish(&mut self, column_len: usize) -> ArrayRef {
         let mut data = std::mem::take(&mut self.arr);
         data.resize(column_len, None);
 
-        let mut builder: GenericByteBuilder<GenericBinaryType<i64>>  =  GenericByteBuilder::new();
+        let mut builder: GenericByteBuilder<GenericBinaryType<i64>> = GenericByteBuilder::new();
         for v in data {
             match v {
                 Some(v) => builder.append_value(v),
                 None => builder.append_null(),
             }
         }
-        let array = Arc::new(builder.finish());
-        Ok(array as ArrayRef)
+        Arc::new(builder.finish()) as ArrayRef
     }
 }
 
@@ -510,6 +529,11 @@ impl_decode_variable_size!(
     i64
 );
 
+// const used for stringifying postgres decimals
+const DEC_DIGITS: i16 = 4;
+// const used for determining sign of numeric
+const NUMERIC_NEG: i16 = 0x4000;
+
 /// Logic ported from src/backend/utils/adt/numeric.c:get_str_from_var
 fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
     // Decimals will be decoded to strings since rust does not have a ubiquitos
@@ -520,7 +544,10 @@ fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
     let weight = i16::from_be_bytes(data[2..4].try_into().unwrap());
     let sign = i16::from_be_bytes(data[4..6].try_into().unwrap());
     let scale = i16::from_be_bytes(data[6..8].try_into().unwrap());
-    let digits: Vec<i16> = data[8..8 + ndigits as usize].chunks(2).map(|c| i16::from_be_bytes(c.try_into().unwrap())).collect();
+    let digits: Vec<i16> = data[8..8 + ndigits as usize]
+        .chunks(2)
+        .map(|c| i16::from_be_bytes(c.try_into().unwrap()))
+        .collect();
 
     // the number of digits before the decimal place
     let pre_decimal = (weight + 1) * DEC_DIGITS;
@@ -545,26 +572,30 @@ fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
     // Otherwise put digits in the decimal string by computing the value for each place in decimal
     } else {
         while digits_index <= weight {
-           let mut dig = if digits_index  < ndigits { digits[digits_index as usize] } else { 0 };
-           let mut putit = digits_index > 0;
+            let mut dig = if digits_index < ndigits {
+                digits[digits_index as usize]
+            } else {
+                0
+            };
+            let mut putit = digits_index > 0;
 
-           /* below unwraps too:
+            /* below unwraps too:
                 d1 = dig / 1000;
-				dig -= d1 * 1000;
-				putit |= (d1 > 0);
-				if (putit)
-					*cp++ = d1 + '0';
-				d1 = dig / 100;
-				dig -= d1 * 100;
-				putit |= (d1 > 0);
-				if (putit)
-					*cp++ = d1 + '0';
-				d1 = dig / 10;
-				dig -= d1 * 10;
-				putit |= (d1 > 0);
-				if (putit)
-					*cp++ = d1 + '0';
-				*cp++ = dig + '0';
+                dig -= d1 * 1000;
+                putit |= (d1 > 0);
+                if (putit)
+                    *cp++ = d1 + '0';
+                d1 = dig / 100;
+                dig -= d1 * 100;
+                putit |= (d1 > 0);
+                if (putit)
+                    *cp++ = d1 + '0';
+                d1 = dig / 10;
+                dig -= d1 * 10;
+                putit |= (d1 > 0);
+                if (putit)
+                    *cp++ = d1 + '0';
+                *cp++ = dig + '0';
             */
 
             let mut place = 1000;
@@ -572,7 +603,9 @@ fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
                 let d1 = dig / place;
                 dig -= d1 * place;
                 putit |= d1 > 0;
-                if putit { decimal.push(d1 as u8 + b'0') }
+                if putit {
+                    decimal.push(d1 as u8 + b'0')
+                }
                 place /= 10;
             }
             decimal.push(dig as u8 + b'0');
@@ -586,8 +619,12 @@ fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
     }
 
     let mut i = 0;
-    while  i < scale {
-        let mut dig = if digits_index >= 0 && digits_index < ndigits { digits[digits_index as usize] } else { 0 };
+    while i < scale {
+        let mut dig = if digits_index >= 0 && digits_index < ndigits {
+            digits[digits_index as usize]
+        } else {
+            0
+        };
         let mut place = 1000;
         // Same as the loop above but no putit since all digits prior to the
         // scale-TH digit are significant
@@ -618,7 +655,6 @@ impl_decode_variable_size!(
     i64
 );
 
-
 //
 pub enum Decoder {
     Boolean(BooleanDecoder),
@@ -629,6 +665,7 @@ pub enum Decoder {
     Float64(Float64Decoder),
     Decimal(DecimalDecoder),
     TimestampMicrosecond(TimestampMicrosecondDecoder),
+    TimestampTzMicrosecond(TimestampTzMicrosecondDecoder),
     Date32(Date32Decoder),
     Time64Microsecond(Time64MicrosecondDecoder),
     DurationMicrosecond(DurationMicrosecondDecoder),
@@ -666,13 +703,21 @@ impl Decoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
-                PostgresType::Decimal => {
-                    Decoder::Decimal(DecimalDecoder { name: name.to_string(), arr: vec![] })
-                }
+                PostgresType::Decimal => Decoder::Decimal(DecimalDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
                 PostgresType::Timestamp => {
                     Decoder::TimestampMicrosecond(TimestampMicrosecondDecoder {
                         name: name.to_string(),
                         arr: vec![],
+                    })
+                }
+                PostgresType::TimestampTz(ref timezone) => {
+                    Decoder::TimestampTzMicrosecond(TimestampTzMicrosecondDecoder {
+                        name: name.to_string(),
+                        arr: vec![],
+                        timezone: timezone.to_string(),
                     })
                 }
                 PostgresType::Date => Decoder::Date32(Date32Decoder {
@@ -689,10 +734,12 @@ impl Decoder {
                         arr: vec![],
                     })
                 }
-                PostgresType::Text | PostgresType::Char | PostgresType::Json => Decoder::String(StringDecoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
+                PostgresType::Text | PostgresType::Char | PostgresType::Json => {
+                    Decoder::String(StringDecoder {
+                        name: name.to_string(),
+                        arr: vec![],
+                    })
+                }
                 PostgresType::Bytea => Decoder::Binary(BinaryDecoder {
                     name: name.to_string(),
                     arr: vec![],
@@ -702,7 +749,7 @@ impl Decoder {
             .collect()
     }
 
-    pub(crate) fn apply(&mut self, buf: &mut ConsumableBuf) -> Result<(), ErrorKind> {
+    pub(crate) fn apply(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind> {
         match *self {
             Decoder::Boolean(ref mut decoder) => decoder.decode(buf),
             Decoder::Int16(ref mut decoder) => decoder.decode(buf),
@@ -712,12 +759,33 @@ impl Decoder {
             Decoder::Float64(ref mut decoder) => decoder.decode(buf),
             Decoder::Decimal(ref mut decoder) => decoder.decode(buf),
             Decoder::TimestampMicrosecond(ref mut decoder) => decoder.decode(buf),
+            Decoder::TimestampTzMicrosecond(ref mut decoder) => decoder.decode(buf),
             Decoder::Date32(ref mut decoder) => decoder.decode(buf),
             Decoder::Time64Microsecond(ref mut decoder) => decoder.decode(buf),
             Decoder::DurationMicrosecond(ref mut decoder) => decoder.decode(buf),
             Decoder::String(ref mut decoder) => decoder.decode(buf),
             Decoder::Binary(ref mut decoder) => decoder.decode(buf),
             Decoder::Jsonb(ref mut decoder) => decoder.decode(buf),
+        }
+    }
+
+    pub(crate) fn name(&self) -> String {
+        match *self {
+            Decoder::Boolean(ref decoder) => decoder.name(),
+            Decoder::Int16(ref decoder) => decoder.name(),
+            Decoder::Int32(ref decoder) => decoder.name(),
+            Decoder::Int64(ref decoder) => decoder.name(),
+            Decoder::Float32(ref decoder) => decoder.name(),
+            Decoder::Float64(ref decoder) => decoder.name(),
+            Decoder::Decimal(ref decoder) => decoder.name(),
+            Decoder::TimestampMicrosecond(ref decoder) => decoder.name(),
+            Decoder::TimestampTzMicrosecond(ref decoder) => decoder.name(),
+            Decoder::Date32(ref decoder) => decoder.name(),
+            Decoder::Time64Microsecond(ref decoder) => decoder.name(),
+            Decoder::DurationMicrosecond(ref decoder) => decoder.name(),
+            Decoder::String(ref decoder) => decoder.name(),
+            Decoder::Binary(ref decoder) => decoder.name(),
+            Decoder::Jsonb(ref decoder) => decoder.name(),
         }
     }
 
@@ -731,6 +799,7 @@ impl Decoder {
             Decoder::Float64(ref decoder) => decoder.column_len(),
             Decoder::Decimal(ref decoder) => decoder.column_len(),
             Decoder::TimestampMicrosecond(ref decoder) => decoder.column_len(),
+            Decoder::TimestampTzMicrosecond(ref decoder) => decoder.column_len(),
             Decoder::Date32(ref decoder) => decoder.column_len(),
             Decoder::Time64Microsecond(ref decoder) => decoder.column_len(),
             Decoder::DurationMicrosecond(ref decoder) => decoder.column_len(),
@@ -740,7 +809,7 @@ impl Decoder {
         }
     }
 
-    pub(crate) fn finish(&mut self, column_len: usize) -> Result<ArrayRef, ErrorKind> {
+    pub(crate) fn finish(&mut self, column_len: usize) -> ArrayRef {
         match *self {
             Decoder::Boolean(ref mut decoder) => decoder.finish(column_len),
             Decoder::Int16(ref mut decoder) => decoder.finish(column_len),
@@ -750,6 +819,7 @@ impl Decoder {
             Decoder::Float64(ref mut decoder) => decoder.finish(column_len),
             Decoder::Decimal(ref mut decoder) => decoder.finish(column_len),
             Decoder::TimestampMicrosecond(ref mut decoder) => decoder.finish(column_len),
+            Decoder::TimestampTzMicrosecond(ref mut decoder) => decoder.finish(column_len),
             Decoder::Date32(ref mut decoder) => decoder.finish(column_len),
             Decoder::Time64Microsecond(ref mut decoder) => decoder.finish(column_len),
             Decoder::DurationMicrosecond(ref mut decoder) => decoder.finish(column_len),

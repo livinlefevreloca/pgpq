@@ -229,6 +229,7 @@ impl From<pgpq::pg_schema::PostgresType> for PostgresType {
             pgpq::pg_schema::PostgresType::Time => PostgresType::Time(Time),
             pgpq::pg_schema::PostgresType::Timestamp => PostgresType::Timestamp(Timestamp),
             pgpq::pg_schema::PostgresType::Interval => PostgresType::Interval(Interval),
+            pgpq::pg_schema::PostgresType::Decimal => todo!(),
             pgpq::pg_schema::PostgresType::List(inner) => {
                 PostgresType::List(List::new((*inner).into()))
             }

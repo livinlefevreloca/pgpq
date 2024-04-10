@@ -1,1 +1,1 @@
-bool_column,boolean,t
+bool_nullable,boolean,t

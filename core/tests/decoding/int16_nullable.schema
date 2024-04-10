@@ -1,1 +1,1 @@
-int16_column,smallint,t
+int16_nullable,smallint,t

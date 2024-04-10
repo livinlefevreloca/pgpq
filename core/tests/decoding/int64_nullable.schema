@@ -1,1 +1,1 @@
-int64_column,bigint,t
+int64_nullable,bigint,t

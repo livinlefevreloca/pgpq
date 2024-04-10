@@ -1,6 +1,6 @@
-use arrow_schema::{Schema, Field, DataType, TimeUnit, SchemaRef};
-use std::sync::Arc;
 use crate::error::ErrorKind;
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeSize {
@@ -25,6 +25,7 @@ pub enum PostgresType {
     Date,
     Time,
     Timestamp,
+    TimestampTz(String),
     Interval,
     List(Box<Column>),
 }
@@ -46,6 +47,7 @@ impl PostgresType {
             PostgresType::Date => TypeSize::Fixed(4),
             PostgresType::Time => TypeSize::Fixed(8),
             PostgresType::Timestamp => TypeSize::Fixed(8),
+            PostgresType::TimestampTz(_) => TypeSize::Fixed(8),
             PostgresType::Interval => TypeSize::Fixed(12),
             PostgresType::Decimal => TypeSize::Variable,
             PostgresType::List(_) => TypeSize::Variable,
@@ -68,6 +70,7 @@ impl PostgresType {
             PostgresType::Date => Some(1082),
             PostgresType::Time => Some(1083),
             PostgresType::Timestamp => Some(1114),
+            PostgresType::TimestampTz(_) => Some(1182),
             PostgresType::Interval => Some(1186),
             PostgresType::List(_) => None,
         }
@@ -89,6 +92,7 @@ impl PostgresType {
             PostgresType::Date => "DATE".to_string(),
             PostgresType::Time => "TIME".to_string(),
             PostgresType::Timestamp => "TIMESTAMP".to_string(),
+            PostgresType::TimestampTz(_) => "TIMESTAMP WITH ZONE".to_string(),
             PostgresType::Interval => "INTERVAL".to_string(),
             PostgresType::List(inner) => {
                 // arrays of structs and such are not supported
@@ -97,28 +101,6 @@ impl PostgresType {
             }
         };
         Some(v)
-    }
-
-    pub fn from_name(name: &str) -> Option<PostgresType> {
-        match name {
-            "BOOL" => Some(PostgresType::Bool),
-            "BYTEA" => Some(PostgresType::Bytea),
-            "INT8" => Some(PostgresType::Int8),
-            "INT2" => Some(PostgresType::Int2),
-            "INT4" => Some(PostgresType::Int4),
-            "CHAR" => Some(PostgresType::Char),
-            "TEXT" => Some(PostgresType::Text),
-            "JSON" => Some(PostgresType::Json),
-            "JSONB" => Some(PostgresType::Jsonb),
-            "FLOAT4" => Some(PostgresType::Float4),
-            "FLOAT8" => Some(PostgresType::Float8),
-            "DECIMAL" => Some(PostgresType::Decimal),
-            "DATE" => Some(PostgresType::Date),
-            "TIME" => Some(PostgresType::Time),
-            "TIMESTAMP" => Some(PostgresType::Timestamp),
-            "INTERVAL" => Some(PostgresType::Interval),
-            _ => None,
-        }
     }
 }
 
@@ -140,12 +122,14 @@ impl From<PostgresType> for DataType {
             PostgresType::Date => DataType::Date32,
             PostgresType::Time => DataType::Time64(TimeUnit::Microsecond),
             PostgresType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+            PostgresType::TimestampTz(timezone) => {
+                DataType::Timestamp(TimeUnit::Microsecond, Some(timezone.into()))
+            }
             PostgresType::Interval => DataType::Duration(TimeUnit::Microsecond),
             PostgresType::List(_) => unimplemented!(),
         }
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
@@ -154,109 +138,80 @@ pub struct Column {
 }
 
 impl Column {
-    pub fn from_parts(type_str: &str, nullable: &str) -> Result<Self, ErrorKind> {
+    pub fn from_parts(type_str: &str, nullable: &str, timezone: String) -> Result<Self, ErrorKind> {
         match type_str {
-            "boolean" => {
-                Ok(Column {
-                    data_type: PostgresType::Bool,
-                    nullable: nullable == "t",
-                })
-            },
-            "bytea" => {
-                Ok(Column {
-                    data_type: PostgresType::Bytea,
-                    nullable: nullable == "t",
-                })
-            },
-            "bigint" => {
-                Ok(Column {
-                    data_type: PostgresType::Int8,
-                    nullable: nullable == "t",
-                })
-            },
-            "smallint" => {
-                Ok(Column {
-                    data_type: PostgresType::Int2,
-                    nullable: nullable == "t",
-                })
-            },
-            "integer" => {
-                Ok(Column {
-                    data_type: PostgresType::Int4,
-                    nullable: nullable == "t",
-                })
-            },
-            "character" | "character varying" => {
-                Ok(Column {
-                    data_type: PostgresType::Char,
-                    nullable: nullable == "t",
-                })
-            },
-            "text" => {
-                Ok(Column {
-                    data_type: PostgresType::Text,
-                    nullable: nullable == "t",
-                })
-            },
-            "json" => {
-                Ok(Column {
-                    data_type: PostgresType::Json,
-                    nullable: nullable == "t",
-                })
-            },
-            "jsonb" => {
-                Ok(Column {
-                    data_type: PostgresType::Jsonb,
-                    nullable: nullable == "t",
-                })
-            },
-            "real" => {
-                Ok(Column {
-                    data_type: PostgresType::Float4,
-                    nullable: nullable == "t",
-                })
-            },
-            "double precision" => {
-                Ok(Column {
-                    data_type: PostgresType::Float8,
-                    nullable: nullable == "t",
-                })
-            },
-            "numeric" => {
-                Ok(Column {
-                    data_type: PostgresType::Decimal,
-                    nullable: nullable == "t",
-                })
-            },
-            "date" => {
-                Ok(Column {
-                    data_type: PostgresType::Date,
-                    nullable: nullable == "t",
-                })
-            },
-            "time" => {
-                Ok(Column {
-                    data_type: PostgresType::Time,
-                    nullable: nullable == "t",
-                })
-            },
-            "timestamp with time zone" | "timestamp without time zone" => {
-                Ok(Column {
-                    data_type: PostgresType::Timestamp,
-                    nullable: nullable == "t",
-                })
-            },
-            "interval" => {
-                Ok(Column {
-                    data_type: PostgresType::Interval,
-                    nullable: nullable == "t",
-                })
-            },
-            _ => {
-                Err(ErrorKind::UnsupportedColumnType { typ: type_str.to_string() })
-            }
+            "boolean" => Ok(Column {
+                data_type: PostgresType::Bool,
+                nullable: nullable == "t",
+            }),
+            "bytea" => Ok(Column {
+                data_type: PostgresType::Bytea,
+                nullable: nullable == "t",
+            }),
+            "bigint" => Ok(Column {
+                data_type: PostgresType::Int8,
+                nullable: nullable == "t",
+            }),
+            "smallint" => Ok(Column {
+                data_type: PostgresType::Int2,
+                nullable: nullable == "t",
+            }),
+            "integer" => Ok(Column {
+                data_type: PostgresType::Int4,
+                nullable: nullable == "t",
+            }),
+            "character" | "character varying" => Ok(Column {
+                data_type: PostgresType::Char,
+                nullable: nullable == "t",
+            }),
+            "text" => Ok(Column {
+                data_type: PostgresType::Text,
+                nullable: nullable == "t",
+            }),
+            "json" => Ok(Column {
+                data_type: PostgresType::Json,
+                nullable: nullable == "t",
+            }),
+            "jsonb" => Ok(Column {
+                data_type: PostgresType::Jsonb,
+                nullable: nullable == "t",
+            }),
+            "real" => Ok(Column {
+                data_type: PostgresType::Float4,
+                nullable: nullable == "t",
+            }),
+            "double precision" => Ok(Column {
+                data_type: PostgresType::Float8,
+                nullable: nullable == "t",
+            }),
+            "numeric" => Ok(Column {
+                data_type: PostgresType::Decimal,
+                nullable: nullable == "t",
+            }),
+            "date" => Ok(Column {
+                data_type: PostgresType::Date,
+                nullable: nullable == "t",
+            }),
+            "time" => Ok(Column {
+                data_type: PostgresType::Time,
+                nullable: nullable == "t",
+            }),
+            "timestamp without time zone" => Ok(Column {
+                data_type: PostgresType::Timestamp,
+                nullable: nullable == "t",
+            }),
+            "timestamp with time zone" => Ok(Column {
+                data_type: PostgresType::TimestampTz(timezone),
+                nullable: nullable == "t",
+            }),
+            "interval" => Ok(Column {
+                data_type: PostgresType::Interval,
+                nullable: nullable == "t",
+            }),
+            _ => Err(ErrorKind::UnsupportedColumnType {
+                typ: type_str.to_string(),
+            }),
         }
-
     }
 }
 
@@ -265,38 +220,46 @@ pub struct PostgresSchema {
     pub columns: Vec<(String, Column)>,
 }
 
-
 impl From<PostgresSchema> for SchemaRef {
     fn from(pg_schema: PostgresSchema) -> Self {
-        let fields: Vec<Field> = pg_schema.columns.iter().map(|(name, col)| {
-            Field::new(name, col.data_type.clone().into(), col.nullable)
-        }).collect();
+        let fields: Vec<Field> = pg_schema
+            .columns
+            .iter()
+            .map(|(name, col)| Field::new(name, col.data_type.clone().into(), col.nullable))
+            .collect();
         Arc::new(Schema::new(fields))
     }
 }
 
 impl PostgresSchema {
-    pub fn from_reader<R: std::io::Read>(mut reader: R, delim: char) -> Result<Self, ErrorKind> {
+    pub fn from_reader<R: std::io::Read>(
+        mut reader: R,
+        delim: char,
+        timezone: String,
+    ) -> Result<Self, ErrorKind> {
         let mut schema_str = String::new();
         reader.read_to_string(&mut schema_str)?;
 
-        let schema = schema_str.split('\n').filter(|s| !s.is_empty()).map(|s|{
-            let parts: Vec<&str> = s.splitn(3, delim).collect();
-            if parts.len() != 3 {
-                return Err(ErrorKind::InvalidColumnSpec{spec: s.to_string()});
-            }
-            let name = parts[0];
-            let typ = parts[1];
-            let nullable = parts[2];
-            let col = Column::from_parts(typ, nullable)?;
-            Ok((name.to_string(), col))
-        }).collect::<Result<Vec<(String, Column)>, ErrorKind>>().map(|columns| {
-            PostgresSchema { columns }
-
-        })?;
+        let schema = schema_str
+            .split('\n')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let parts: Vec<&str> = s.splitn(3, delim).collect();
+                if parts.len() != 3 {
+                    return Err(ErrorKind::InvalidColumnSpec {
+                        spec: s.to_string(),
+                    });
+                }
+                let name = parts[0];
+                let typ = parts[1];
+                let nullable = parts[2];
+                let col = Column::from_parts(typ, nullable, timezone.to_string())?;
+                Ok((name.to_string(), col))
+            })
+            .collect::<Result<Vec<(String, Column)>, ErrorKind>>()
+            .map(|columns| PostgresSchema { columns })?;
 
         Ok(schema)
-
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &(String, Column)> {
