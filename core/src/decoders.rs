@@ -672,15 +672,18 @@ fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
     }
 
     // trim trailing zeros and return the string
-    Ok(trim_trailing_zeros(decimal, scale))
+    Ok(truncate_and_finalize(decimal, scale))
 }
 
-pub fn trim_trailing_zeros(mut v: Vec<u8>, scale: i16) -> String {
+pub fn truncate_and_finalize(mut v: Vec<u8>, scale: i16) -> String {
+    // if there is a decimal point do some general cleanup
     let decimal_point_idx =  v.iter().position(|&c| c == b'.');
     match decimal_point_idx {
         Some(idx) => {
+            // If the number ends in a decimal point, add a zero
             if idx == v.len() - 1 {
                 v.push(b'0')
+            // Strip any trailing zeros after the decimal point
             } else {
                 while v.len() - idx - 1 > scale as usize {
                     v.pop();
@@ -689,8 +692,7 @@ pub fn trim_trailing_zeros(mut v: Vec<u8>, scale: i16) -> String {
         },
         None => {}
     };
-    let result = String::from_utf8(v).unwrap();
-    result
+    String::from_utf8(v).unwrap()
 }
 
 pub struct NumericDecoder {
