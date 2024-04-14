@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Seek};
 
-use arrow_array::{Array, RecordBatch};
+use arrow_array::RecordBatch;
 use arrow_schema::Fields;
 use arrow_schema::Schema;
 use bytes::{Buf, BufMut, BytesMut};
@@ -305,7 +305,6 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
             let tuple_len: u16 = match local_buf.consume_into_u16() {
                 Ok(len) => len,
                 Err(e) => {
-                    println!("Error reading tuple length: {:?}", e);
                     return BatchDecodeResult::Error(e);
                 }
             };
@@ -378,6 +377,16 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
         // we are in a partial consume state. We will truncate the columns to the length
         // of the shortest column and pick up the lost data in the next batch.
         let column_len = self.decoders.iter().map(|d| d.column_len()).min().unwrap();
+
+        // Determine which columns in the batch are fully null so that we can alter the schema
+        // to reflect this.
+        let null_columns = self
+            .decoders
+            .iter()
+            .filter(|decoder| decoder.is_null())
+            .map(|decoder| decoder.name())
+            .collect::<Vec<String>>();
+
         // For each decoder call its finish method to coerce the data into an Arrow array.
         // and append the array to the columns vector.
         let columns = self
@@ -385,8 +394,9 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
             .iter_mut()
             .map(|decoder| decoder.finish(column_len))
             .collect();
+
         // Create a new RecordBatch from the columns vector and return it.
-        let record_batch = RecordBatch::try_new(self.schema.clone().into(), columns)?;
+        let record_batch = RecordBatch::try_new(self.schema.clone().nullify_columns(&null_columns).into(), columns)?;
 
         Ok(record_batch)
     }

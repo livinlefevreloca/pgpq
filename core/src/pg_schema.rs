@@ -21,13 +21,14 @@ pub enum PostgresType {
     Jsonb,
     Float4,
     Float8,
-    Decimal,
+    Numeric,
     Date,
     Time,
     Timestamp,
     TimestampTz(String),
     Interval,
     List(Box<Column>),
+    Null,
 }
 
 impl PostgresType {
@@ -49,8 +50,9 @@ impl PostgresType {
             PostgresType::Timestamp => TypeSize::Fixed(8),
             PostgresType::TimestampTz(_) => TypeSize::Fixed(8),
             PostgresType::Interval => TypeSize::Fixed(12),
-            PostgresType::Decimal => TypeSize::Variable,
+            PostgresType::Numeric => TypeSize::Variable,
             PostgresType::List(_) => TypeSize::Variable,
+            PostgresType::Null => TypeSize::Fixed(0),
         }
     }
     pub fn oid(&self) -> Option<u32> {
@@ -66,13 +68,14 @@ impl PostgresType {
             PostgresType::Jsonb => Some(3802),
             PostgresType::Float4 => Some(700),
             PostgresType::Float8 => Some(701),
-            PostgresType::Decimal => Some(1700),
+            PostgresType::Numeric => Some(1700),
             PostgresType::Date => Some(1082),
             PostgresType::Time => Some(1083),
             PostgresType::Timestamp => Some(1114),
             PostgresType::TimestampTz(_) => Some(1182),
             PostgresType::Interval => Some(1186),
             PostgresType::List(_) => None,
+            PostgresType::Null => None,
         }
     }
     pub fn name(&self) -> Option<String> {
@@ -88,7 +91,7 @@ impl PostgresType {
             PostgresType::Jsonb => "JSONB".to_string(),
             PostgresType::Float4 => "FLOAT4".to_string(),
             PostgresType::Float8 => "FLOAT8".to_string(),
-            PostgresType::Decimal => "DECIMAL".to_string(),
+            PostgresType::Numeric => "DECIMAL".to_string(),
             PostgresType::Date => "DATE".to_string(),
             PostgresType::Time => "TIME".to_string(),
             PostgresType::Timestamp => "TIMESTAMP".to_string(),
@@ -99,6 +102,7 @@ impl PostgresType {
                 let inner_tp = inner.data_type.name().unwrap();
                 format!("{inner_tp}[]")
             }
+            PostgresType::Null => "NULL".to_string(),
         };
         Some(v)
     }
@@ -108,17 +112,17 @@ impl From<PostgresType> for DataType {
     fn from(pg_type: PostgresType) -> Self {
         match pg_type {
             PostgresType::Bool => DataType::Boolean,
-            PostgresType::Bytea => DataType::LargeBinary,
+            PostgresType::Bytea => DataType::Binary,
             PostgresType::Int8 => DataType::Int64,
             PostgresType::Int2 => DataType::Int16,
             PostgresType::Int4 => DataType::Int32,
-            PostgresType::Char => DataType::LargeUtf8,
-            PostgresType::Text => DataType::LargeUtf8,
-            PostgresType::Json => DataType::LargeUtf8,
-            PostgresType::Jsonb => DataType::LargeUtf8,
+            PostgresType::Char => DataType::Utf8,
+            PostgresType::Text => DataType::Utf8,
+            PostgresType::Json => DataType::Utf8,
+            PostgresType::Jsonb => DataType::Utf8,
             PostgresType::Float4 => DataType::Float32,
             PostgresType::Float8 => DataType::Float64,
-            PostgresType::Decimal => DataType::LargeUtf8,
+            PostgresType::Numeric => DataType::Utf8,
             PostgresType::Date => DataType::Date32,
             PostgresType::Time => DataType::Time64(TimeUnit::Microsecond),
             PostgresType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -127,6 +131,7 @@ impl From<PostgresType> for DataType {
             }
             PostgresType::Interval => DataType::Duration(TimeUnit::Microsecond),
             PostgresType::List(_) => unimplemented!(),
+            PostgresType::Null => DataType::Null,
         }
     }
 }
@@ -185,7 +190,7 @@ impl Column {
                 nullable: nullable == "t",
             }),
             "numeric" => Ok(Column {
-                data_type: PostgresType::Decimal,
+                data_type: PostgresType::Numeric,
                 nullable: nullable == "t",
             }),
             "date" => Ok(Column {
@@ -260,6 +265,15 @@ impl PostgresSchema {
             .map(|columns| PostgresSchema { columns })?;
 
         Ok(schema)
+    }
+
+    pub fn nullify_columns(mut self, columns: &[String]) -> Self {
+        for (name, col) in self.columns.iter_mut() {
+            if columns.contains(name) {
+                col.data_type = PostgresType::Null;
+            }
+        }
+        self
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &(String, Column)> {
