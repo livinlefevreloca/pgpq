@@ -1,6 +1,6 @@
 #![allow(clippy::redundant_closure_call)]
 
-use crate::encoders::{PG_BASE_DATE_OFFSET, PG_BASE_TIMESTAMP_OFFSET_US};
+use std::sync::Arc;
 use arrow_array::builder::GenericByteBuilder;
 use arrow_array::types::GenericBinaryType;
 use arrow_array::{self, ArrayRef};
@@ -9,80 +9,15 @@ use arrow_array::{
     GenericStringArray, Int16Array, Int32Array, Int64Array, Time64MicrosecondArray,
     TimestampMicrosecondArray, NullArray
 };
-use std::fmt::Debug;
-use std::sync::Arc;
 
+use crate::encoders::{PG_BASE_DATE_OFFSET, PG_BASE_TIMESTAMP_OFFSET_US};
 use crate::error::ErrorKind;
+use crate::buffer_view::BufferView;
 use crate::pg_schema::{PostgresSchema, PostgresType};
 
-pub(crate) struct BufferView<'a> {
-    inner: &'a [u8],
-    consumed: usize,
-}
 
-impl Debug for BufferView<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", &self.inner[self.consumed..])
-    }
-}
-
-impl BufferView<'_> {
-    pub fn new(inner: &'_ [u8]) -> BufferView<'_> {
-        BufferView { inner, consumed: 0 }
-    }
-
-    pub fn consume_into_u32(&mut self) -> Result<u32, ErrorKind> {
-        if self.consumed + 4 > self.inner.len() {
-            return Err(ErrorKind::IncompleteData);
-        }
-        let res = u32::from_be_bytes(
-            self.inner[self.consumed..self.consumed + 4]
-                .try_into()
-                .unwrap(),
-        );
-        self.consumed += 4;
-        Ok(res)
-    }
-
-    pub fn consume_into_u16(&mut self) -> Result<u16, ErrorKind> {
-        if self.consumed + 2 > self.inner.len() {
-            return Err(ErrorKind::IncompleteData);
-        }
-        let res = u16::from_be_bytes(
-            self.inner[self.consumed..self.consumed + 2]
-                .try_into()
-                .unwrap(),
-        );
-        self.consumed += 2;
-        Ok(res)
-    }
-
-    pub fn consume_into_vec_n(&mut self, n: usize) -> Result<Vec<u8>, ErrorKind> {
-        if self.consumed + n > self.inner.len() {
-            return Err(ErrorKind::IncompleteData);
-        }
-        let data = self.inner[self.consumed..self.consumed + n].to_vec();
-        self.consumed += n;
-        if data.len() != n {
-            return Err(ErrorKind::IncompleteData);
-        }
-        Ok(data)
-    }
-
-    pub fn remaining(&self) -> usize {
-        self.inner.len() - self.consumed
-    }
-
-    pub fn consumed(&self) -> usize {
-        self.consumed
-    }
-
-    pub fn swallow(&mut self, n: usize) {
-        self.consumed += n;
-    }
-}
-
-pub(crate) trait Decode {
+/// Trait defining the methods needed to decode a Postgres type into an Arrow array
+pub(crate) trait Decoder {
     fn decode(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind>;
     fn finish(&mut self, column_len: usize) -> ArrayRef;
     fn column_len(&self) -> usize;
@@ -90,9 +25,10 @@ pub(crate) trait Decode {
     fn is_null(&self) -> bool;
 }
 
+
 macro_rules! impl_decode {
     ($struct_name:ident, $size:expr, $transform:expr, $array_kind:ident) => {
-        impl Decode for $struct_name {
+        impl Decoder for $struct_name {
             fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
                 let field_size = buf.consume_into_u32()?;
                 if field_size == u32::MAX {
@@ -104,9 +40,9 @@ macro_rules! impl_decode {
                 }
 
                 let data = buf.consume_into_vec_n(field_size as usize)?;
+                //
                 // Unwrap is safe here because have checked the field size is the expected size
                 // above
-
                 let value = $transform(data.try_into().unwrap());
                 self.arr.push(Some(value));
 
@@ -140,7 +76,7 @@ macro_rules! impl_decode {
 
 macro_rules! impl_decode_fallible {
     ($struct_name:ident, $size:expr, $transform:expr, $array_kind:ident) => {
-        impl Decode for $struct_name {
+        impl Decoder for $struct_name {
             fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
                 let field_size = buf.consume_into_u32()?;
 
@@ -154,6 +90,7 @@ macro_rules! impl_decode_fallible {
                 }
 
                 let data = buf.consume_into_vec_n(field_size as usize)?;
+
                 // Unwrap is safe here because have checked the field size is the expected size
                 // above
                 match $transform(data.try_into().unwrap()) {
@@ -202,7 +139,7 @@ macro_rules! impl_decode_fallible {
 
 macro_rules! impl_decode_variable_size {
     ($struct_name:ident, $transform:expr, $extra_bytes:expr, $array_kind:ident, $offset_size:ident) => {
-        impl Decode for $struct_name {
+        impl Decoder for $struct_name {
             fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
                 let field_size = buf.consume_into_u32()?;
                 if field_size == u32::MAX {
@@ -344,7 +281,7 @@ pub struct TimestampTzMicrosecondDecoder {
     timezone: String,
 }
 
-impl Decode for TimestampTzMicrosecondDecoder {
+impl Decoder for TimestampTzMicrosecondDecoder {
     fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
         let field_size = buf.consume_into_u32()?;
         if field_size == u32::MAX {
@@ -425,7 +362,7 @@ impl_decode!(
     Time64MicrosecondArray
 );
 
-/// Convert Postgres durations to Arrow durations (milliseconds)
+/// Convert Postgres durations to Arrow durations (microseconds)
 fn convert_pg_duration_to_arrow_duration(
     duration_us: i64,
     duration_days: i32,
@@ -500,7 +437,7 @@ pub struct BinaryDecoder {
     arr: Vec<Option<Vec<u8>>>,
 }
 
-impl Decode for BinaryDecoder {
+impl Decoder for BinaryDecoder {
     fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
         let field_size = buf.consume_into_u32()?;
         if field_size == u32::MAX {
@@ -569,8 +506,9 @@ const DEC_DIGITS: i16 = 4;
 // const used for determining sign of numeric
 const NUMERIC_NEG: i16 = 0x4000;
 
-/// Logic ported from src/backend/utils/adt/numeric.c:get_str_from_var
+/// Parse a Postgres numeric type in binary format into a string
 fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
+    // Logic ported from src/backend/utils/adt/numeric.c:get_str_from_var
     // Decimals will be decoded to strings since rust does not have a ubiquitos
     // decimal type and arrow does not implment `From` for any of them. Arrow
     // does have a Decimal128 array but its only accepts i128s as input
@@ -675,7 +613,9 @@ fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
     Ok(truncate_and_finalize(decimal, scale))
 }
 
-pub fn truncate_and_finalize(mut v: Vec<u8>, scale: i16) -> String {
+/// truncate any trailing zeros on end of the string if they not significant.
+/// If the number ends in a decimal point, add a zero
+fn truncate_and_finalize(mut v: Vec<u8>, scale: i16) -> String {
     // if there is a decimal point do some general cleanup
     let decimal_point_idx =  v.iter().position(|&c| c == b'.');
     match decimal_point_idx {
@@ -709,7 +649,7 @@ impl_decode_variable_size!(
 );
 
 //
-pub enum Decoder {
+pub enum PostgresDecoder {
     Boolean(BooleanDecoder),
     Int16(Int16Decoder),
     Int32(Int32Decoder),
@@ -727,73 +667,73 @@ pub enum Decoder {
     Jsonb(JsonbDecoder),
 }
 //
-impl Decoder {
+impl PostgresDecoder {
     pub fn new(schema: &PostgresSchema) -> Vec<Self> {
         schema
             .iter()
             .map(|(name, column)| match column.data_type {
-                PostgresType::Bool => Decoder::Boolean(BooleanDecoder {
+                PostgresType::Bool => PostgresDecoder::Boolean(BooleanDecoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
-                PostgresType::Int2 => Decoder::Int16(Int16Decoder {
+                PostgresType::Int2 => PostgresDecoder::Int16(Int16Decoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
-                PostgresType::Int4 => Decoder::Int32(Int32Decoder {
+                PostgresType::Int4 => PostgresDecoder::Int32(Int32Decoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
-                PostgresType::Int8 => Decoder::Int64(Int64Decoder {
+                PostgresType::Int8 => PostgresDecoder::Int64(Int64Decoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
-                PostgresType::Float4 => Decoder::Float32(Float32Decoder {
+                PostgresType::Float4 => PostgresDecoder::Float32(Float32Decoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
-                PostgresType::Float8 => Decoder::Float64(Float64Decoder {
+                PostgresType::Float8 => PostgresDecoder::Float64(Float64Decoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
-                PostgresType::Numeric => Decoder::Numeric(NumericDecoder {
+                PostgresType::Numeric => PostgresDecoder::Numeric(NumericDecoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
                 PostgresType::Timestamp => {
-                    Decoder::TimestampMicrosecond(TimestampMicrosecondDecoder {
+                    PostgresDecoder::TimestampMicrosecond(TimestampMicrosecondDecoder {
                         name: name.to_string(),
                         arr: vec![],
                     })
                 }
                 PostgresType::TimestampTz(ref timezone) => {
-                    Decoder::TimestampTzMicrosecond(TimestampTzMicrosecondDecoder {
+                    PostgresDecoder::TimestampTzMicrosecond(TimestampTzMicrosecondDecoder {
                         name: name.to_string(),
                         arr: vec![],
                         timezone: timezone.to_string(),
                     })
                 }
-                PostgresType::Date => Decoder::Date32(Date32Decoder {
+                PostgresType::Date => PostgresDecoder::Date32(Date32Decoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
-                PostgresType::Time => Decoder::Time64Microsecond(Time64MicrosecondDecoder {
+                PostgresType::Time => PostgresDecoder::Time64Microsecond(Time64MicrosecondDecoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
                 PostgresType::Interval => {
-                    Decoder::DurationMicrosecond(DurationMicrosecondDecoder {
+                    PostgresDecoder::DurationMicrosecond(DurationMicrosecondDecoder {
                         name: name.to_string(),
                         arr: vec![],
                     })
                 }
                 PostgresType::Text | PostgresType::Char | PostgresType::Json => {
-                    Decoder::String(StringDecoder {
+                    PostgresDecoder::String(StringDecoder {
                         name: name.to_string(),
                         arr: vec![],
                     })
                 }
-                PostgresType::Bytea => Decoder::Binary(BinaryDecoder {
+                PostgresType::Bytea => PostgresDecoder::Binary(BinaryDecoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
@@ -804,102 +744,102 @@ impl Decoder {
 
     pub(crate) fn apply(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind> {
         match *self {
-            Decoder::Boolean(ref mut decoder) => decoder.decode(buf),
-            Decoder::Int16(ref mut decoder) => decoder.decode(buf),
-            Decoder::Int32(ref mut decoder) => decoder.decode(buf),
-            Decoder::Int64(ref mut decoder) => decoder.decode(buf),
-            Decoder::Float32(ref mut decoder) => decoder.decode(buf),
-            Decoder::Float64(ref mut decoder) => decoder.decode(buf),
-            Decoder::Numeric(ref mut decoder) => decoder.decode(buf),
-            Decoder::TimestampMicrosecond(ref mut decoder) => decoder.decode(buf),
-            Decoder::TimestampTzMicrosecond(ref mut decoder) => decoder.decode(buf),
-            Decoder::Date32(ref mut decoder) => decoder.decode(buf),
-            Decoder::Time64Microsecond(ref mut decoder) => decoder.decode(buf),
-            Decoder::DurationMicrosecond(ref mut decoder) => decoder.decode(buf),
-            Decoder::String(ref mut decoder) => decoder.decode(buf),
-            Decoder::Binary(ref mut decoder) => decoder.decode(buf),
-            Decoder::Jsonb(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Boolean(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Int16(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Int32(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Int64(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Float32(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Float64(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Numeric(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::TimestampMicrosecond(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::TimestampTzMicrosecond(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Date32(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Time64Microsecond(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::DurationMicrosecond(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::String(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Binary(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Jsonb(ref mut decoder) => decoder.decode(buf),
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn name(&self) -> String {
         match *self {
-            Decoder::Boolean(ref decoder) => decoder.name(),
-            Decoder::Int16(ref decoder) => decoder.name(),
-            Decoder::Int32(ref decoder) => decoder.name(),
-            Decoder::Int64(ref decoder) => decoder.name(),
-            Decoder::Float32(ref decoder) => decoder.name(),
-            Decoder::Float64(ref decoder) => decoder.name(),
-            Decoder::Numeric(ref decoder) => decoder.name(),
-            Decoder::TimestampMicrosecond(ref decoder) => decoder.name(),
-            Decoder::TimestampTzMicrosecond(ref decoder) => decoder.name(),
-            Decoder::Date32(ref decoder) => decoder.name(),
-            Decoder::Time64Microsecond(ref decoder) => decoder.name(),
-            Decoder::DurationMicrosecond(ref decoder) => decoder.name(),
-            Decoder::String(ref decoder) => decoder.name(),
-            Decoder::Binary(ref decoder) => decoder.name(),
-            Decoder::Jsonb(ref decoder) => decoder.name(),
+            PostgresDecoder::Boolean(ref decoder) => decoder.name(),
+            PostgresDecoder::Int16(ref decoder) => decoder.name(),
+            PostgresDecoder::Int32(ref decoder) => decoder.name(),
+            PostgresDecoder::Int64(ref decoder) => decoder.name(),
+            PostgresDecoder::Float32(ref decoder) => decoder.name(),
+            PostgresDecoder::Float64(ref decoder) => decoder.name(),
+            PostgresDecoder::Numeric(ref decoder) => decoder.name(),
+            PostgresDecoder::TimestampMicrosecond(ref decoder) => decoder.name(),
+            PostgresDecoder::TimestampTzMicrosecond(ref decoder) => decoder.name(),
+            PostgresDecoder::Date32(ref decoder) => decoder.name(),
+            PostgresDecoder::Time64Microsecond(ref decoder) => decoder.name(),
+            PostgresDecoder::DurationMicrosecond(ref decoder) => decoder.name(),
+            PostgresDecoder::String(ref decoder) => decoder.name(),
+            PostgresDecoder::Binary(ref decoder) => decoder.name(),
+            PostgresDecoder::Jsonb(ref decoder) => decoder.name(),
         }
     }
 
     pub(crate) fn column_len(&self) -> usize {
         match *self {
-            Decoder::Boolean(ref decoder) => decoder.column_len(),
-            Decoder::Int16(ref decoder) => decoder.column_len(),
-            Decoder::Int32(ref decoder) => decoder.column_len(),
-            Decoder::Int64(ref decoder) => decoder.column_len(),
-            Decoder::Float32(ref decoder) => decoder.column_len(),
-            Decoder::Float64(ref decoder) => decoder.column_len(),
-            Decoder::Numeric(ref decoder) => decoder.column_len(),
-            Decoder::TimestampMicrosecond(ref decoder) => decoder.column_len(),
-            Decoder::TimestampTzMicrosecond(ref decoder) => decoder.column_len(),
-            Decoder::Date32(ref decoder) => decoder.column_len(),
-            Decoder::Time64Microsecond(ref decoder) => decoder.column_len(),
-            Decoder::DurationMicrosecond(ref decoder) => decoder.column_len(),
-            Decoder::String(ref decoder) => decoder.column_len(),
-            Decoder::Binary(ref decoder) => decoder.column_len(),
-            Decoder::Jsonb(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Boolean(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Int16(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Int32(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Int64(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Float32(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Float64(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Numeric(ref decoder) => decoder.column_len(),
+            PostgresDecoder::TimestampMicrosecond(ref decoder) => decoder.column_len(),
+            PostgresDecoder::TimestampTzMicrosecond(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Date32(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Time64Microsecond(ref decoder) => decoder.column_len(),
+            PostgresDecoder::DurationMicrosecond(ref decoder) => decoder.column_len(),
+            PostgresDecoder::String(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Binary(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Jsonb(ref decoder) => decoder.column_len(),
         }
     }
 
     pub(crate) fn finish(&mut self, column_len: usize) -> ArrayRef {
         match *self {
-            Decoder::Boolean(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Int16(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Int32(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Int64(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Float32(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Float64(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Numeric(ref mut decoder) => decoder.finish(column_len),
-            Decoder::TimestampMicrosecond(ref mut decoder) => decoder.finish(column_len),
-            Decoder::TimestampTzMicrosecond(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Date32(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Time64Microsecond(ref mut decoder) => decoder.finish(column_len),
-            Decoder::DurationMicrosecond(ref mut decoder) => decoder.finish(column_len),
-            Decoder::String(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Binary(ref mut decoder) => decoder.finish(column_len),
-            Decoder::Jsonb(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Boolean(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Int16(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Int32(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Int64(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Float32(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Float64(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Numeric(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::TimestampMicrosecond(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::TimestampTzMicrosecond(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Date32(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Time64Microsecond(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::DurationMicrosecond(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::String(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Binary(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Jsonb(ref mut decoder) => decoder.finish(column_len),
         }
     }
 
     pub(crate) fn is_null(&self) -> bool {
         match *self {
-            Decoder::Boolean(ref decoder) => decoder.is_null(),
-            Decoder::Int16(ref decoder) => decoder.is_null(),
-            Decoder::Int32(ref decoder) => decoder.is_null(),
-            Decoder::Int64(ref decoder) => decoder.is_null(),
-            Decoder::Float32(ref decoder) => decoder.is_null(),
-            Decoder::Float64(ref decoder) => decoder.is_null(),
-            Decoder::Numeric(ref decoder) => decoder.is_null(),
-            Decoder::TimestampMicrosecond(ref decoder) => decoder.is_null(),
-            Decoder::TimestampTzMicrosecond(ref decoder) => decoder.is_null(),
-            Decoder::Date32(ref decoder) => decoder.is_null(),
-            Decoder::Time64Microsecond(ref decoder) => decoder.is_null(),
-            Decoder::DurationMicrosecond(ref decoder) => decoder.is_null(),
-            Decoder::String(ref decoder) => decoder.is_null(),
-            Decoder::Binary(ref decoder) => decoder.is_null(),
-            Decoder::Jsonb(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Boolean(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Int16(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Int32(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Int64(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Float32(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Float64(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Numeric(ref decoder) => decoder.is_null(),
+            PostgresDecoder::TimestampMicrosecond(ref decoder) => decoder.is_null(),
+            PostgresDecoder::TimestampTzMicrosecond(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Date32(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Time64Microsecond(ref decoder) => decoder.is_null(),
+            PostgresDecoder::DurationMicrosecond(ref decoder) => decoder.is_null(),
+            PostgresDecoder::String(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Binary(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Jsonb(ref decoder) => decoder.is_null(),
         }
     }
 }

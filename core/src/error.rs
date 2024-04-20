@@ -58,6 +58,8 @@ pub enum ErrorKind {
     IOError { io_error: std::io::Error },
     #[error("Got an error: {name} in Arrow while decoding: {reason}")]
     ArrowErrorDecode { reason: String, name: String },
+    #[error("ArrowType: {typ:?} not currently supported for decoding")]
+    UnsupportedArrowType { typ: DataType },
 }
 
 impl From<std::io::Error> for ErrorKind {

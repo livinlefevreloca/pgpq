@@ -11,8 +11,10 @@ pub mod decoders;
 pub mod encoders;
 pub mod error;
 pub mod pg_schema;
+mod buffer_view;
 
-use crate::decoders::{BufferView, Decoder};
+use crate::decoders::PostgresDecoder;
+use crate::buffer_view::BufferView;
 use crate::encoders::{BuildEncoder, Encode, EncoderBuilder};
 use crate::pg_schema::PostgresSchema;
 
@@ -162,7 +164,7 @@ enum BatchDecodeResult {
 
 pub struct PostgresBinaryToArrowDecoder<R> {
     schema: PostgresSchema,
-    decoders: Vec<Decoder>,
+    decoders: Vec<PostgresDecoder>,
     source: R,
     state: EncoderState,
     capacity: usize,
@@ -170,7 +172,7 @@ pub struct PostgresBinaryToArrowDecoder<R> {
 
 impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
     pub fn new(schema: PostgresSchema, source: R, capacity: usize) -> Result<Self, ErrorKind> {
-        let decoders = Decoder::new(&schema);
+        let decoders = PostgresDecoder::new(&schema);
         Ok(PostgresBinaryToArrowDecoder {
             schema,
             decoders,
@@ -180,21 +182,47 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
         })
     }
 
+    /// Try to create a new decoder using an arrow schema. Will fail if the types in the schema
+    /// are not supported by the decoder.
+    pub fn try_new_with_arrow_schema(
+        schema: Schema,
+        source: R,
+        capacity: usize,
+    ) -> Result<Self, ErrorKind> {
+        let pg_schema = PostgresSchema::try_from(schema)?;
+        let decoders = PostgresDecoder::new(&pg_schema);
+        Ok(PostgresBinaryToArrowDecoder {
+            decoders,
+            schema: pg_schema,
+            source,
+            state: EncoderState::Created,
+            capacity,
+        })
+    }
+
+    /// Reads the header from the source and validates it.
     pub fn read_header(&mut self) -> Result<(), ErrorKind> {
         assert_eq!(self.state, EncoderState::Created);
+
+        // Header is always 11 bytes long. b"PGCOPY\n\xff\r\n\0"
         let mut header = [0; 11];
         self.source.read_exact(&mut header)?;
         if header != HEADER_MAGIC_BYTES {
             return Err(ErrorKind::InvalidBinaryHeader { bytes: header });
         }
+
+        // read flags and header extension both of which we ignore the values of.
         let mut flags = [0; 4];
         self.source.read_exact(&mut flags)?;
+
         let mut header_extension = [0; 4];
         self.source.read_exact(&mut header_extension)?;
+
         self.state = EncoderState::Encoding;
         Ok(())
     }
 
+    /// read batches of bytes from the source and decode them into RecordBatches.
     pub fn decode_batches(&mut self) -> Result<Vec<RecordBatch>, ErrorKind> {
         let mut batches = Vec::new();
         let mut buf = BytesMut::with_capacity(self.capacity);
@@ -270,7 +298,6 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
                     // If we receive an Incomplete BatchDecodeResult, increase the capacity of the
                     // buffer reading more data from the source and try to decode the batch again.
                     BatchDecodeResult::Incomplete(_) => {
-                        // println!("Increasing capacity to {}", self.capacity * 2);
                         // increase the capacity attribute of the decoder by a factor of 2.
                         buf.reserve(self.capacity);
                         self.capacity *= 2;
@@ -282,8 +309,10 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
         Ok(batches)
     }
 
+    /// Decode a single batch of bytes from the buffer. This method is called by decode_batches
+    /// and has several different completion states each represented by a BatchDecodeResult.
     fn decode_batch(&mut self, buf: &mut BytesMut) -> BatchDecodeResult {
-        // ensure that the decoder is in the correct state befpre proceeding.
+        // ensure that the decoder is in the correct state before proceeding.
         assert_eq!(self.state, EncoderState::Encoding);
 
         // create a new BufferView from the buffer.
@@ -321,15 +350,12 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
                 // If local_buf has been fully consumed and we have not read any rows,
                 // return a BatchDecodeResult::Incomplete.
                 if local_buf.remaining() == 0 && rows == 0 {
-                    // println!("Incomplete no data remaining");
                     return BatchDecodeResult::Incomplete(local_buf.consumed());
                 // If local_buf has been fully consumed and we have read some rows,
                 // return a BatchDecodeResult::PartialConsume, passing the number of bytes
                 // consumed before reading the tuple to the caller so it can know how much data
                 // was consumed.
                 } else if local_buf.remaining() == 0 {
-                    // println!("Partial consume no data remaining");
-                    // println!("Finishing batch. Rows: {}", rows);
                     return match self.finish_batch() {
                         Ok(batch) => BatchDecodeResult::PartialConsume { batch, consumed },
                         Err(e) => BatchDecodeResult::Error(e),
@@ -345,12 +371,9 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
                     Err(ErrorKind::IncompleteData) => {
                         // If we have not read any rows, return a BatchDecodeResult::Incomplete.
                         if rows == 0 {
-                            // println!("Incomplete mid-batch");
                             return BatchDecodeResult::Incomplete(local_buf.consumed());
                         } else {
                             // If we have read some rows, return a BatchDecodeResult::PartialConsume,
-                            // println!("Partial consume mid-batch");
-                            // println!("Finishing batch. Rows: {}", rows);
                             return match self.finish_batch() {
                                 Ok(batch) => BatchDecodeResult::PartialConsume { batch, consumed },
                                 Err(e) => BatchDecodeResult::Error(e),
@@ -364,8 +387,6 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
             rows += 1;
         }
 
-        // println!("Finishing batch. Rows: {}", rows);
-        // Finish the batch and return the result.
         match self.finish_batch() {
             Ok(batch) => BatchDecodeResult::Batch(batch),
             Err(e) => BatchDecodeResult::Error(e),
@@ -395,10 +416,7 @@ impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
             .map(|decoder| decoder.finish(column_len))
             .collect();
 
-        // Create a new RecordBatch from the columns vector and return it.
-        let record_batch = RecordBatch::try_new(self.schema.clone().nullify_columns(&null_columns).into(), columns)?;
-
-        Ok(record_batch)
+        Ok(RecordBatch::try_new(self.schema.clone().nullify_columns(&null_columns).into(), columns)?)
     }
 }
 

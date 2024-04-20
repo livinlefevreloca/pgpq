@@ -136,6 +136,36 @@ impl From<PostgresType> for DataType {
     }
 }
 
+
+impl TryFrom<DataType> for PostgresType {
+    type Error = ErrorKind;
+    fn try_from(data_type: DataType) -> Result<Self, ErrorKind> {
+        let pg_type = match data_type {
+            DataType::Boolean => PostgresType::Bool,
+            DataType::Binary => PostgresType::Bytea,
+            DataType::Int64 => PostgresType::Int8,
+            DataType::Int32 => PostgresType::Int4,
+            DataType::Int16 => PostgresType::Int2,
+            DataType::Utf8 => PostgresType::Text,
+            DataType::Float32 => PostgresType::Float4,
+            DataType::Float64 => PostgresType::Float8,
+            DataType::Date32 => PostgresType::Date,
+            DataType::Time64(_) => PostgresType::Time,
+            DataType::Timestamp(_, tz) => {
+                if let Some(timezone) = tz {
+                    PostgresType::TimestampTz(timezone.to_string())
+                } else {
+                    PostgresType::Timestamp
+                }
+            }
+            DataType::Duration(_) => PostgresType::Interval,
+            DataType::Null => PostgresType::Null,
+            _ => return Err(ErrorKind::UnsupportedArrowType { typ: data_type }),
+        };
+        Ok(pg_type)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub data_type: PostgresType,
@@ -233,6 +263,29 @@ impl From<PostgresSchema> for SchemaRef {
             .map(|(name, col)| Field::new(name, col.data_type.clone().into(), col.nullable))
             .collect();
         Arc::new(Schema::new(fields))
+    }
+}
+
+impl TryFrom<Schema> for PostgresSchema {
+    type Error = ErrorKind;
+    fn try_from(schema: Schema) -> Result<PostgresSchema, ErrorKind> {
+        let columns: Result<Vec<_>, ErrorKind> = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let name = field.name().to_string();
+                let data_type = field.data_type().clone();
+                let nullable = field.is_nullable();
+                let data_type = PostgresType::try_from(data_type)?;
+                let col = Column {
+                    data_type,
+                    nullable,
+                };
+                Ok((name, col))
+            })
+            .collect();
+
+        Ok(PostgresSchema { columns: columns? })
     }
 }
 
