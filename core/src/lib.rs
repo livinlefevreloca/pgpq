@@ -170,7 +170,7 @@ pub struct PostgresBinaryToArrowDecoder<R> {
     capacity: usize,
 }
 
-impl<R: BufRead + Seek> PostgresBinaryToArrowDecoder<R> {
+impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
     pub fn new(schema: PostgresSchema, source: R, capacity: usize) -> Result<Self, ErrorKind> {
         let decoders = PostgresDecoder::new(&schema);
         Ok(PostgresBinaryToArrowDecoder {
