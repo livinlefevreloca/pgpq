@@ -1,19 +1,22 @@
 #![allow(clippy::redundant_closure_call)]
 
 use std::sync::Arc;
+use arrow::compute::concat;
+use arrow::buffer::{OffsetBuffer, NullBuffer};
+use arrow_schema::{DataType, Field};
 use arrow_array::builder::GenericByteBuilder;
 use arrow_array::types::GenericBinaryType;
-use arrow_array::{self, ArrayRef};
+use arrow_array::{self, ArrayRef, Array};
 use arrow_array::{
     BooleanArray, Date32Array, DurationMicrosecondArray, Float32Array, Float64Array,
     GenericStringArray, Int16Array, Int32Array, Int64Array, Time64MicrosecondArray,
-    TimestampMicrosecondArray, NullArray
+    TimestampMicrosecondArray, NullArray, GenericListArray
 };
 
 use crate::encoders::{PG_BASE_DATE_OFFSET, PG_BASE_TIMESTAMP_OFFSET_US};
 use crate::error::ErrorKind;
 use crate::buffer_view::BufferView;
-use crate::pg_schema::{PostgresSchema, PostgresType};
+use crate::pg_schema::{PostgresSchema, PostgresType, Column};
 
 
 /// Trait defining the methods needed to decode a Postgres type into an Arrow array
@@ -648,6 +651,81 @@ impl_decode_variable_size!(
     i32
 );
 
+pub struct ArrayDecoder {
+    name: String,
+    arr: Vec<ArrayRef>,
+    inner: Box<PostgresDecoder>,
+}
+
+impl Decoder for ArrayDecoder {
+    fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
+        let field_size = buf.consume_into_u32()?;
+        if field_size == u32::MAX {
+            self.arr.push(Arc::new(NullArray::new(0)));
+            return Ok(());
+        }
+
+        let ndim = buf.consume_into_u32()?;
+        let _flags = buf.consume_into_u32()?;
+        let _elemtype = buf.consume_into_u32()?;
+
+        let mut dims = vec![];
+        for _ in 0..ndim {
+            let dim = buf.consume_into_u32()?;
+            dims.push(dim);
+            // consume the lbound whihc we dont need
+            buf.consume_into_u32()?;
+        }
+
+        let nitems = dims.iter().product::<u32>() as usize;
+
+        for _ in 0..nitems {
+            self.inner.decode(buf)?;
+        }
+        let array = self.inner.finish(nitems);
+        self.arr.push(array);
+
+        Ok(())
+    }
+
+    fn finish(&mut self, column_len: usize) -> ArrayRef {
+        let data_type = self.arr[0].data_type();
+        let length = self.arr[0].len();
+
+        let mut offsets = vec![0; length + 1];
+        for i in 1..=length {
+            offsets[i] = offsets[i - 1] + self.arr[i - 1].len();
+        }
+
+        let array_refs: Vec<& dyn Array> = self.arr.iter().map(|a| a.as_ref()).collect();
+        let nulls: Vec<Option<&NullBuffer>> = array_refs.iter().map(|a| a.nulls()).collect();
+        let arrays = concat(&array_refs).unwrap();
+
+        let list_data = GenericListArray::<i32>::new(
+            Arc::new(Field::new("inner", data_type.clone(), true)),
+            OffsetBuffer::from_lengths(offsets),
+            arrays,
+            None,
+        );
+
+        Arc::new(list_data) as ArrayRef
+    }
+
+    fn is_null(&self) -> bool {
+        unimplemented!()
+    }
+
+    fn column_len(&self) -> usize {
+        self.arr.len()
+    }
+
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+}
+
+
 //
 pub enum PostgresDecoder {
     Boolean(BooleanDecoder),
@@ -665,13 +743,19 @@ pub enum PostgresDecoder {
     String(StringDecoder),
     Binary(BinaryDecoder),
     Jsonb(JsonbDecoder),
+    List(ArrayDecoder),
 }
-//
+
+
+
+
+pub(crate) fn create_decoders(schema: &PostgresSchema) -> Vec<PostgresDecoder> {
+    schema.iter().map(|(name, column)| PostgresDecoder::new(name, column)).collect()
+}
+
 impl PostgresDecoder {
-    pub fn new(schema: &PostgresSchema) -> Vec<Self> {
-        schema
-            .iter()
-            .map(|(name, column)| match column.data_type {
+    pub fn new(name: &str, column: &Column) -> Self {
+        match column.data_type {
                 PostgresType::Bool => PostgresDecoder::Boolean(BooleanDecoder {
                     name: name.to_string(),
                     arr: vec![],
@@ -737,12 +821,19 @@ impl PostgresDecoder {
                     name: name.to_string(),
                     arr: vec![],
                 }),
+                PostgresType::List(ref inner) => {
+                    let inner_decoder = Box::new(PostgresDecoder::new("inner", inner));
+                    PostgresDecoder::List(ArrayDecoder {
+                        name: name.to_string(),
+                        arr: vec![],
+                        inner: inner_decoder,
+                    })
+                }
                 _ => unimplemented!(),
-            })
-            .collect()
+            }
     }
 
-    pub(crate) fn apply(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind> {
+    pub(crate) fn decode(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind> {
         match *self {
             PostgresDecoder::Boolean(ref mut decoder) => decoder.decode(buf),
             PostgresDecoder::Int16(ref mut decoder) => decoder.decode(buf),
@@ -759,6 +850,7 @@ impl PostgresDecoder {
             PostgresDecoder::String(ref mut decoder) => decoder.decode(buf),
             PostgresDecoder::Binary(ref mut decoder) => decoder.decode(buf),
             PostgresDecoder::Jsonb(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::List(ref mut decoder) => decoder.decode(buf),
         }
     }
 
@@ -780,6 +872,7 @@ impl PostgresDecoder {
             PostgresDecoder::String(ref decoder) => decoder.name(),
             PostgresDecoder::Binary(ref decoder) => decoder.name(),
             PostgresDecoder::Jsonb(ref decoder) => decoder.name(),
+            PostgresDecoder::List(ref decoder) => decoder.name(),
         }
     }
 
@@ -800,6 +893,7 @@ impl PostgresDecoder {
             PostgresDecoder::String(ref decoder) => decoder.column_len(),
             PostgresDecoder::Binary(ref decoder) => decoder.column_len(),
             PostgresDecoder::Jsonb(ref decoder) => decoder.column_len(),
+            PostgresDecoder::List(ref decoder) => decoder.column_len(),
         }
     }
 
@@ -820,6 +914,7 @@ impl PostgresDecoder {
             PostgresDecoder::String(ref mut decoder) => decoder.finish(column_len),
             PostgresDecoder::Binary(ref mut decoder) => decoder.finish(column_len),
             PostgresDecoder::Jsonb(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::List(ref mut decoder) => decoder.finish(column_len),
         }
     }
 
@@ -840,6 +935,7 @@ impl PostgresDecoder {
             PostgresDecoder::String(ref decoder) => decoder.is_null(),
             PostgresDecoder::Binary(ref decoder) => decoder.is_null(),
             PostgresDecoder::Jsonb(ref decoder) => decoder.is_null(),
+            PostgresDecoder::List(ref decoder) => decoder.is_null(),
         }
     }
 }

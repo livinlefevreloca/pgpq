@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, Seek};
+use std::io::BufRead;
 
 use arrow_array::RecordBatch;
 use arrow_schema::Fields;
@@ -13,7 +13,7 @@ pub mod error;
 pub mod pg_schema;
 mod buffer_view;
 
-use crate::decoders::PostgresDecoder;
+use crate::decoders::{PostgresDecoder, create_decoders};
 use crate::buffer_view::BufferView;
 use crate::encoders::{BuildEncoder, Encode, EncoderBuilder};
 use crate::pg_schema::PostgresSchema;
@@ -172,7 +172,7 @@ pub struct PostgresBinaryToArrowDecoder<R> {
 
 impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
     pub fn new(schema: PostgresSchema, source: R, capacity: usize) -> Result<Self, ErrorKind> {
-        let decoders = PostgresDecoder::new(&schema);
+        let decoders = create_decoders(&schema);
         Ok(PostgresBinaryToArrowDecoder {
             schema,
             decoders,
@@ -190,7 +190,7 @@ impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
         capacity: usize,
     ) -> Result<Self, ErrorKind> {
         let pg_schema = PostgresSchema::try_from(schema)?;
-        let decoders = PostgresDecoder::new(&pg_schema);
+        let decoders = create_decoders(&pg_schema);
         Ok(PostgresBinaryToArrowDecoder {
             decoders,
             schema: pg_schema,
@@ -362,7 +362,7 @@ impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
                     };
                 }
                 // Apply the decoder to the local_buf. Cosume the data from the buffer as needed
-                match decoder.apply(&mut local_buf) {
+                match decoder.decode(&mut local_buf) {
                     // If the decoder was able to decode the data, continue to the next column.
                     Ok(_) => {}
                     // If we receive a IncompleteData error, we have reached the end of the data in

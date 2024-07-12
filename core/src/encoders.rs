@@ -10,7 +10,7 @@ use crate::error::ErrorKind;
 use crate::pg_schema::{Column, PostgresType, TypeSize};
 
 #[inline]
-fn downcast_checked<'a, T: 'static>(arr: &'a dyn Array, field: &str) -> Result<&'a T, ErrorKind> {
+pub(crate) fn downcast_checked<'a, T: 'static>(arr: &'a dyn Array, field: &str) -> Result<&'a T, ErrorKind> {
     match arr.as_any().downcast_ref::<T>() {
         Some(v) => Ok(v),
         None => Err(ErrorKind::mismatched_column_type(
