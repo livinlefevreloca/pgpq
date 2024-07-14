@@ -1,0 +1,984 @@
+#![allow(clippy::redundant_closure_call)]
+
+use std::sync::Arc;
+use arrow::compute::concat;
+use arrow::buffer::{OffsetBuffer, NullBuffer, BooleanBuffer};
+use arrow_schema::{DataType, Field};
+use arrow_array::builder::GenericByteBuilder;
+use arrow_array::types::GenericBinaryType;
+use arrow_array::{self, ArrayRef, Array};
+use arrow_array::{
+    BooleanArray, Date32Array, DurationMicrosecondArray, Float32Array, Float64Array,
+    GenericStringArray, Int16Array, Int32Array, Int64Array, Time64MicrosecondArray,
+    TimestampMicrosecondArray, NullArray, GenericListArray
+};
+
+use crate::encoders::{PG_BASE_DATE_OFFSET, PG_BASE_TIMESTAMP_OFFSET_US};
+use crate::error::ErrorKind;
+use crate::buffer_view::BufferView;
+use crate::pg_schema::{PostgresSchema, PostgresType, Column};
+
+
+/// Trait defining the methods needed to decode a Postgres type into an Arrow array
+pub(crate) trait Decoder {
+    fn decode(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind>;
+    fn finish(&mut self, column_len: usize) -> ArrayRef;
+    fn column_len(&self) -> usize;
+    fn name(&self) -> String;
+    fn is_null(&self) -> bool;
+}
+
+
+macro_rules! impl_decode {
+    ($struct_name:ident, $size:expr, $transform:expr, $array_kind:ident) => {
+        impl Decoder for $struct_name {
+            fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
+                let field_size = buf.consume_into_u32()?;
+                if field_size == u32::MAX {
+                    self.arr.push(None);
+                    return Ok(());
+                }
+                if field_size != $size {
+                    return Err(ErrorKind::IncompleteData);
+                }
+
+                let data = buf.consume_into_vec_n(field_size as usize)?;
+                //
+                // Unwrap is safe here because have checked the field size is the expected size
+                // above
+                let value = $transform(data.try_into().unwrap());
+                self.arr.push(Some(value));
+
+                Ok(())
+            }
+
+            fn column_len(&self) -> usize {
+                self.arr.len()
+            }
+
+            fn name(&self) -> String {
+                self.name.to_string()
+            }
+
+            fn finish(&mut self, column_len: usize) -> ArrayRef {
+                self.arr.resize(column_len, None);
+                if self.is_null() {
+                    return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
+                }
+                let data = std::mem::take(&mut self.arr);
+                let array = Arc::new($array_kind::from(data));
+                array as ArrayRef
+            }
+
+            fn is_null(&self) -> bool {
+                self.arr.iter().all(|v| v.is_none())
+            }
+        }
+    };
+}
+
+macro_rules! impl_decode_fallible {
+    ($struct_name:ident, $size:expr, $transform:expr, $array_kind:ident) => {
+        impl Decoder for $struct_name {
+            fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
+                let field_size = buf.consume_into_u32()?;
+
+                if field_size == u32::MAX {
+                    self.arr.push(None);
+                    return Ok(());
+                }
+
+                if field_size != $size {
+                    return Err(ErrorKind::IncompleteData);
+                }
+
+                let data = buf.consume_into_vec_n(field_size as usize)?;
+
+                // Unwrap is safe here because have checked the field size is the expected size
+                // above
+                match $transform(data.try_into().unwrap()) {
+                    Ok(v) => self.arr.push(Some(v)),
+                    Err(e) => {
+                        // If the error is a decode error, return a decode error with the name of the field
+                        return match e {
+                            ErrorKind::Decode { reason, .. } => {
+                                return Err(ErrorKind::Decode {
+                                    reason,
+                                    name: self.name.to_string(),
+                                })
+                            }
+                            _ => Err(e),
+                        };
+                    }
+                };
+
+                Ok(())
+            }
+
+            fn column_len(&self) -> usize {
+                self.arr.len()
+            }
+
+            fn name(&self) -> String {
+                self.name.to_string()
+            }
+
+            fn finish(&mut self, column_len: usize) -> ArrayRef {
+                self.arr.resize(column_len, None);
+                if self.is_null() {
+                    return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
+                }
+                let data = std::mem::take(&mut self.arr);
+                let array = Arc::new($array_kind::from(data));
+                array as ArrayRef
+            }
+
+            fn is_null(&self) -> bool {
+                self.arr.iter().all(|v| v.is_none())
+            }
+        }
+    };
+}
+
+macro_rules! impl_decode_variable_size {
+    ($struct_name:ident, $transform:expr, $extra_bytes:expr, $array_kind:ident, $offset_size:ident) => {
+        impl Decoder for $struct_name {
+            fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
+                let field_size = buf.consume_into_u32()?;
+                if field_size == u32::MAX {
+                    self.arr.push(None);
+                    return Ok(());
+                }
+
+                if field_size > buf.remaining() as u32 {
+                    return Err(ErrorKind::IncompleteData);
+                }
+
+                // Consume and any extra data that is not part of the field
+                // This is needed for example on jsonb fields where the first
+                // byte is the version number. This is more efficient than
+                // using remove in the transform function or creating a new
+                // vec from a slice of the data passed into it.
+                buf.swallow($extra_bytes);
+
+                let data = buf.consume_into_vec_n(field_size as usize)?;
+                match $transform(data.try_into().unwrap()) {
+                    Ok(v) => self.arr.push(Some(v)),
+                    Err(e) => {
+                        // If the error is a decode error, return a decode error with the name of the field
+                        return match e {
+                            ErrorKind::Decode { reason, .. } => {
+                                return Err(ErrorKind::Decode {
+                                    reason,
+                                    name: self.name.to_string(),
+                                })
+                            }
+                            _ => Err(e),
+                        };
+                    }
+                };
+
+                Ok(())
+            }
+
+            fn column_len(&self) -> usize {
+                self.arr.len()
+            }
+
+            fn name(&self) -> String {
+                self.name.to_string()
+            }
+
+            fn finish(&mut self, column_len: usize) -> ArrayRef {
+                self.arr.resize(column_len, None);
+                if self.is_null() {
+                    return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
+                }
+                let data = std::mem::take(&mut self.arr);
+                let array = Arc::new($array_kind::<$offset_size>::from(data));
+                array as ArrayRef
+            }
+
+            fn is_null(&self) -> bool {
+                self.arr.iter().all(|v| v.is_none())
+            }
+        }
+    };
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct BooleanDecoder {
+    name: String,
+    arr: Vec<Option<bool>>,
+}
+
+impl_decode!(BooleanDecoder, 1, |b: [u8; 1]| b[0] == 1, BooleanArray);
+
+#[derive(Debug)]
+pub struct Int16Decoder {
+    name: String,
+    arr: Vec<Option<i16>>,
+}
+
+impl_decode!(Int16Decoder, 2, i16::from_be_bytes, Int16Array);
+
+#[derive(Debug)]
+pub struct Int32Decoder {
+    name: String,
+    arr: Vec<Option<i32>>,
+}
+
+impl_decode!(Int32Decoder, 4, i32::from_be_bytes, Int32Array);
+
+#[derive(Debug)]
+pub struct Int64Decoder {
+    name: String,
+    arr: Vec<Option<i64>>,
+}
+
+impl_decode!(Int64Decoder, 8, i64::from_be_bytes, Int64Array);
+
+#[derive(Debug)]
+pub struct Float32Decoder {
+    name: String,
+    arr: Vec<Option<f32>>,
+}
+
+impl_decode!(Float32Decoder, 4, f32::from_be_bytes, Float32Array);
+
+#[derive(Debug)]
+pub struct Float64Decoder {
+    name: String,
+    arr: Vec<Option<f64>>,
+}
+
+impl_decode!(Float64Decoder, 8, f64::from_be_bytes, Float64Array);
+
+/// Convert Postgres timestamps (microseconds since 2000-01-01) to Arrow timestamps (mircroseconds since 1970-01-01)
+#[inline(always)]
+fn convert_pg_timestamp_to_arrow_timestamp_microseconds(
+    timestamp_us: i64,
+) -> Result<i64, ErrorKind> {
+    // adjust the timestamp from microseconds since 2000-01-01 to microseconds since 1970-01-01 checking for overflows and underflow
+    timestamp_us
+        .checked_add(PG_BASE_TIMESTAMP_OFFSET_US)
+        .ok_or_else(|| ErrorKind::Decode {
+            reason: "Overflow converting microseconds since 2000-01-01 (Postgres) to microseconds since 1970-01-01 (Arrow)".to_string(),
+            name: "".to_string(),
+        })
+}
+
+#[derive(Debug)]
+pub struct TimestampMicrosecondDecoder {
+    name: String,
+    arr: Vec<Option<i64>>,
+}
+
+impl_decode_fallible!(
+    TimestampMicrosecondDecoder,
+    8,
+    |b| {
+        let timestamp_us = i64::from_be_bytes(b);
+        convert_pg_timestamp_to_arrow_timestamp_microseconds(timestamp_us)
+    },
+    TimestampMicrosecondArray
+);
+
+#[derive(Debug)]
+pub struct TimestampTzMicrosecondDecoder {
+    name: String,
+    arr: Vec<Option<i64>>,
+    timezone: String,
+}
+
+impl Decoder for TimestampTzMicrosecondDecoder {
+    fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
+        let field_size = buf.consume_into_u32()?;
+        if field_size == u32::MAX {
+            self.arr.push(None);
+            return Ok(());
+        }
+
+        if field_size != 8 {
+            return Err(ErrorKind::IncompleteData);
+        }
+
+        let data = buf.consume_into_vec_n(field_size as usize)?;
+        let timestamp_us = i64::from_be_bytes(data.try_into().unwrap());
+        let timestamp_us = convert_pg_timestamp_to_arrow_timestamp_microseconds(timestamp_us)?;
+        self.arr.push(Some(timestamp_us));
+
+        Ok(())
+    }
+
+    fn column_len(&self) -> usize {
+        self.arr.len()
+    }
+
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn finish(&mut self, column_len: usize) -> ArrayRef {
+        self.arr.resize(column_len, None);
+        if self.is_null() {
+            return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
+        }
+        let data = std::mem::take(&mut self.arr);
+        let array = Arc::new(
+            TimestampMicrosecondArray::from(data).with_timezone(self.timezone.to_string()),
+        );
+        array as ArrayRef
+    }
+
+    fn is_null(&self) -> bool {
+        self.arr.iter().all(|v| v.is_none())
+    }
+}
+
+/// Convert Postgres dates (days since 2000-01-01) to Arrow dates (days since 1970-01-01)
+#[inline(always)]
+fn convert_pg_date_to_arrow_date(date: i32) -> Result<i32, ErrorKind> {
+    date.checked_add(PG_BASE_DATE_OFFSET).ok_or_else(|| ErrorKind::Decode {
+        reason: "Overflow converting days since 2000-01-01 (Postgres) to days since 1970-01-01 (Arrow)".to_string(),
+        name: "".to_string(),
+    })
+}
+
+#[derive(Debug)]
+pub struct Date32Decoder {
+    name: String,
+    arr: Vec<Option<i32>>,
+}
+
+impl_decode_fallible!(
+    Date32Decoder,
+    4,
+    |b| {
+        let date = i32::from_be_bytes(b);
+        convert_pg_date_to_arrow_date(date)
+    },
+    Date32Array
+);
+
+#[derive(Debug)]
+pub struct Time64MicrosecondDecoder {
+    name: String,
+    arr: Vec<Option<i64>>,
+}
+
+impl_decode!(
+    Time64MicrosecondDecoder,
+    8,
+    i64::from_be_bytes,
+    Time64MicrosecondArray
+);
+
+/// Convert Postgres durations to Arrow durations (microseconds)
+fn convert_pg_duration_to_arrow_duration(
+    duration_us: i64,
+    duration_days: i32,
+    duration_months: i32,
+) -> Result<i64, ErrorKind> {
+    let days = (duration_days as i64)
+        .checked_mul(24 * 60 * 60 * 1_000_000)
+        .ok_or_else(|| ErrorKind::Decode {
+            reason: "Overflow converting days to microseconds".to_string(),
+            name: "".to_string(),
+        })?;
+    let months = (duration_months as i64)
+        .checked_mul(30 * 24 * 60 * 60 * 1_000_000)
+        .ok_or_else(|| ErrorKind::Decode {
+            reason: "Overflow converting months to microseconds".to_string(),
+            name: "".to_string(),
+        })?;
+
+    duration_us
+        .checked_add(days)
+        .ok_or_else(|| ErrorKind::Decode {
+            reason: "Overflow adding days in microseconds to duration microseconds".to_string(),
+            name: "".to_string(),
+        })
+        .map(|v| {
+            v.checked_add(months).ok_or_else(|| ErrorKind::Decode {
+                reason: "Overflow adding months in microseconds to duration microseconds"
+                    .to_string(),
+                name: "".to_string(),
+            })
+        })?
+}
+
+#[derive(Debug)]
+pub struct DurationMicrosecondDecoder {
+    name: String,
+    arr: Vec<Option<i64>>,
+}
+
+impl_decode_fallible!(
+    DurationMicrosecondDecoder,
+    16,
+    |b: [u8; 16]| {
+        // Unwrap here since we know the exact size of the array we are passing
+        let duration_us = i64::from_be_bytes(b[..8].try_into().unwrap());
+        let duration_days = i32::from_be_bytes(b[8..12].try_into().unwrap());
+        let duration_months = i32::from_be_bytes(b[12..16].try_into().unwrap());
+        convert_pg_duration_to_arrow_duration(duration_us, duration_days, duration_months)
+    },
+    DurationMicrosecondArray
+);
+
+#[derive(Debug)]
+pub struct StringDecoder {
+    name: String,
+    arr: Vec<Option<String>>,
+}
+
+impl_decode_variable_size!(
+    StringDecoder,
+    |b: Vec<u8>| {
+        String::from_utf8(b).map_err(|_| ErrorKind::Decode {
+            reason: "Invalid UTF-8 string".to_string(),
+            name: "".to_string(),
+        })
+    },
+    0,
+    GenericStringArray,
+    i32
+);
+
+#[derive(Debug)]
+pub struct BinaryDecoder {
+    name: String,
+    arr: Vec<Option<Vec<u8>>>,
+}
+
+impl Decoder for BinaryDecoder {
+    fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
+        let field_size = buf.consume_into_u32()?;
+        if field_size == u32::MAX {
+            self.arr.push(None);
+            return Ok(());
+        }
+
+        let data = buf.consume_into_vec_n(field_size as usize)?;
+        self.arr.push(Some(data));
+
+        Ok(())
+    }
+
+    fn column_len(&self) -> usize {
+        self.arr.len()
+    }
+
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn finish(&mut self, column_len: usize) -> ArrayRef {
+        self.arr.resize(column_len, None);
+        if self.is_null() {
+            return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
+        }
+
+        let data = std::mem::take(&mut self.arr);
+        let mut builder: GenericByteBuilder<GenericBinaryType<i32>> = GenericByteBuilder::new();
+        for v in data {
+            match v {
+                Some(v) => builder.append_value(v),
+                None => builder.append_null(),
+            }
+        }
+        Arc::new(builder.finish()) as ArrayRef
+    }
+
+    fn is_null(&self) -> bool {
+        self.arr.iter().all(|v| v.is_none())
+    }
+}
+
+#[derive(Debug)]
+pub struct JsonbDecoder {
+    name: String,
+    arr: Vec<Option<String>>,
+}
+
+impl_decode_variable_size!(
+    JsonbDecoder,
+    |b: Vec<u8>| {
+        String::from_utf8(b).map_err(|_| ErrorKind::Decode {
+            reason: "Invalid UTF-8 string".to_string(),
+            name: "".to_string(),
+        })
+    },
+    // Remove the first byte which is the version number
+    // https://www.postgresql.org/docs/13/datatype-json.html
+    1,
+    GenericStringArray,
+    i64
+);
+
+// const used for stringifying postgres decimals
+const DEC_DIGITS: i16 = 4;
+// const used for determining sign of numeric
+const NUMERIC_NEG: i16 = 0x4000;
+
+/// Parse a Postgres numeric type in binary format into a string
+fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
+    // Logic ported from src/backend/utils/adt/numeric.c:get_str_from_var
+    // Decimals will be decoded to strings since rust does not have a ubiquitos
+    // decimal type and arrow does not implment `From` for any of them. Arrow
+    // does have a Decimal128 array but its only accepts i128s as input
+    // TODO: Seems like there could be a fast path here for simpler numbers
+    let ndigits = i16::from_be_bytes(data[0..2].try_into().unwrap());
+    let weight = i16::from_be_bytes(data[2..4].try_into().unwrap());
+    let sign = i16::from_be_bytes(data[4..6].try_into().unwrap());
+    let scale = i16::from_be_bytes(data[6..8].try_into().unwrap());
+    let digits: Vec<i16> = data[8..8 + (ndigits as usize) * (std::mem::size_of::<i16>())]
+        .chunks(2)
+        .map(|c| i16::from_be_bytes(c.try_into().unwrap()))
+        .collect();
+
+    // the number of digits before the decimal place
+    let pre_decimal = (weight + 1) * DEC_DIGITS;
+
+    // scale is the number digits after the decimal place.
+    // 2 is for a possible sign and decimal point
+    let str_len: usize = (pre_decimal + DEC_DIGITS + 2 + scale) as usize;
+
+    // -1 because we dont need to account for the null terminator
+    let mut decimal: Vec<u8> = Vec::with_capacity(str_len - 1);
+
+    // put a negative sign if the numeric is negative
+    if sign == NUMERIC_NEG {
+        decimal.push(b'-');
+    }
+
+    let mut digits_index = 0;
+    // If weight is less than 0 we have a fractional number.
+    // Put a 0 before the decimal.
+    if weight < 0 {
+        decimal.push(b'0');
+    // Otherwise put digits in the decimal string by computing the value for each place in decimal
+    } else {
+        while digits_index <= weight {
+            let mut dig = if digits_index < ndigits {
+                digits[digits_index as usize]
+            } else {
+                0
+            };
+            let mut putit = digits_index > 0;
+
+            /* below unwraps too:
+                d1 = dig / 1000;
+                dig -= d1 * 1000;
+                putit |= (d1 > 0);
+                if (putit)
+                    *cp++ = d1 + '0';
+                d1 = dig / 100;
+                dig -= d1 * 100;
+                putit |= (d1 > 0);
+                if (putit)
+                    *cp++ = d1 + '0';
+                d1 = dig / 10;
+                dig -= d1 * 10;
+                putit |= (d1 > 0);
+                if (putit)
+                    *cp++ = d1 + '0';
+                *cp++ = dig + '0';
+            */
+
+            let mut place = 1000;
+            while place > 1 {
+                let d1 = dig / place;
+                dig -= d1 * place;
+                putit |= d1 > 0;
+                if putit {
+                    decimal.push(d1 as u8 + b'0');
+                }
+                place /= 10;
+            }
+            decimal.push(dig as u8 + b'0');
+            digits_index += 1;
+        }
+
+    }
+    // If scale is > 0 we have digits after the decimal point
+    if scale > 0 {
+        decimal.push(b'.');
+    }
+    while digits_index < ndigits {
+        let mut dig = if digits_index >= 0 && digits_index < ndigits {
+            digits[digits_index as usize]
+        } else {
+            0
+        };
+        let mut place = 1000;
+        // Same as the loop above but no putit since all digits prior to the
+        // scale-TH digit are significant
+        while place > 1 {
+            let d1 = dig / place;
+            dig -= d1 * place;
+            decimal.push(d1 as u8 + b'0');
+            place /= 10;
+        }
+        decimal.push(dig as u8 + b'0');
+        digits_index += 1;
+    }
+
+    // trim trailing zeros and return the string
+    Ok(truncate_and_finalize(decimal, scale))
+}
+
+/// truncate any trailing zeros on end of the string if they not significant.
+/// If the number ends in a decimal point, add a zero
+fn truncate_and_finalize(mut v: Vec<u8>, scale: i16) -> String {
+    // if there is a decimal point do some general cleanup
+    let decimal_point_idx =  v.iter().position(|&c| c == b'.');
+    match decimal_point_idx {
+        Some(idx) => {
+            // If the number ends in a decimal point, add a zero
+            if idx == v.len() - 1 {
+                v.push(b'0')
+            // Strip any trailing zeros after the decimal point
+            } else {
+                while v.len() - idx - 1 > scale as usize {
+                    v.pop();
+                }
+            }
+        },
+        None => {}
+    };
+    String::from_utf8(v).unwrap()
+}
+
+#[derive(Debug)]
+pub struct NumericDecoder {
+    name: String,
+    arr: Vec<Option<String>>,
+}
+
+impl_decode_variable_size!(
+    NumericDecoder,
+    parse_pg_decimal_to_string,
+    0,
+    GenericStringArray,
+    i32
+);
+
+#[derive(Debug)]
+pub struct ArrayDecoder {
+    name: String,
+    arr: Vec<ArrayRef>,
+    inner: Box<PostgresDecoder>,
+}
+
+
+impl Decoder for ArrayDecoder {
+    fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
+        let field_size = buf.consume_into_u32()?;
+        if field_size == u32::MAX {
+            self.arr.push(Arc::new(NullArray::new(0)));
+            return Ok(());
+        }
+
+        let ndim = buf.consume_into_u32()?;
+        let _flags = buf.consume_into_u32()?;
+        let _elemtype = buf.consume_into_u32()?;
+
+        let mut dims = vec![];
+        for _ in 0..ndim {
+            let dim = buf.consume_into_u32()?;
+            dims.push(dim);
+            // consume the lbound which we dont need
+            buf.consume_into_u32()?;
+        }
+
+        let nitems = dims.iter().product::<u32>() as usize;
+
+        for _ in 0..nitems {
+            self.inner.decode(buf)?;
+        }
+        let array = self.inner.finish(nitems);
+        self.arr.push(array);
+
+        Ok(())
+    }
+
+    fn finish(&mut self, _column_len: usize) -> ArrayRef {
+        // Check if all the arrays are null and return a null array if so
+        if self.is_null() {
+            return Arc::new(NullArray::new(0)) as ArrayRef;
+        }
+
+        let arrays = std::mem::take(&mut self.arr);
+
+        // Build the offset buffer for the commbined ListArray using
+        // the lengths of the component arrays
+        let mut offset_values = vec![0 as i32];
+        for i in 1..arrays.len() + 1 {
+            offset_values.push(arrays[i - 1].len() as i32 + offset_values[i - 1]);
+        }
+        let offsets = OffsetBuffer::new(offset_values.into());
+
+        // Concatenate the data of the component arrays
+        // to create the child data of the ListArray
+        let array_refs: Vec<& dyn Array> = arrays.iter().filter(
+            |a| !matches!(a.data_type(), DataType::Null)
+        ).map(|a| a.as_ref()).collect();
+        let child_data = concat(&array_refs).unwrap();
+
+        // Calculate the null buffer for the ListArray
+        // by checking if the component arrays are null
+        let null_values = arrays.iter().map(|a| {
+            match a.data_type() {
+                DataType::Null => false,
+                _ => true,
+            }
+        }).collect::<Vec<bool>>();
+
+        // If there are no nulls, return None for the null buffer
+        let nulls = if null_values.iter().all(|v| *v) {
+            None
+        } else {
+            Some(NullBuffer::from(BooleanBuffer::from(null_values)))
+        };
+
+        // Construct the ListArray from parts
+        Arc::new(GenericListArray::new(
+            Arc::new(Field::new(self.name().replace("list_", ""), arrays[0].data_type().clone(), true)),
+            offsets,
+            child_data,
+            nulls,
+        )) as ArrayRef
+    }
+
+    fn is_null(&self) -> bool {
+        self.arr.iter().all(|a| matches!(a.data_type(), DataType::Null))
+    }
+
+    fn column_len(&self) -> usize {
+        self.arr.len()
+    }
+
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+}
+
+
+//
+#[derive(Debug)]
+pub enum PostgresDecoder {
+    Boolean(BooleanDecoder),
+    Int16(Int16Decoder),
+    Int32(Int32Decoder),
+    Int64(Int64Decoder),
+    Float32(Float32Decoder),
+    Float64(Float64Decoder),
+    Numeric(NumericDecoder),
+    TimestampMicrosecond(TimestampMicrosecondDecoder),
+    TimestampTzMicrosecond(TimestampTzMicrosecondDecoder),
+    Date32(Date32Decoder),
+    Time64Microsecond(Time64MicrosecondDecoder),
+    DurationMicrosecond(DurationMicrosecondDecoder),
+    String(StringDecoder),
+    Binary(BinaryDecoder),
+    Jsonb(JsonbDecoder),
+    List(ArrayDecoder),
+}
+
+
+
+
+pub(crate) fn create_decoders(schema: &PostgresSchema) -> Vec<PostgresDecoder> {
+    schema.iter().map(|(name, column)| PostgresDecoder::new(name, column)).collect()
+}
+
+impl PostgresDecoder {
+    pub fn new(name: &str, column: &Column) -> Self {
+        match column.data_type {
+                PostgresType::Bool => PostgresDecoder::Boolean(BooleanDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Int2 => PostgresDecoder::Int16(Int16Decoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Int4 => PostgresDecoder::Int32(Int32Decoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Int8 => PostgresDecoder::Int64(Int64Decoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Float4 => PostgresDecoder::Float32(Float32Decoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Float8 => PostgresDecoder::Float64(Float64Decoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Numeric => PostgresDecoder::Numeric(NumericDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Timestamp => {
+                    PostgresDecoder::TimestampMicrosecond(TimestampMicrosecondDecoder {
+                        name: name.to_string(),
+                        arr: vec![],
+                    })
+                }
+                PostgresType::TimestampTz(ref timezone) => {
+                    PostgresDecoder::TimestampTzMicrosecond(TimestampTzMicrosecondDecoder {
+                        name: name.to_string(),
+                        arr: vec![],
+                        timezone: timezone.to_string(),
+                    })
+                }
+                PostgresType::Date => PostgresDecoder::Date32(Date32Decoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Time => PostgresDecoder::Time64Microsecond(Time64MicrosecondDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::Interval => {
+                    PostgresDecoder::DurationMicrosecond(DurationMicrosecondDecoder {
+                        name: name.to_string(),
+                        arr: vec![],
+                    })
+                }
+                PostgresType::Text | PostgresType::Char | PostgresType::Json => {
+                    PostgresDecoder::String(StringDecoder {
+                        name: name.to_string(),
+                        arr: vec![],
+                    })
+                }
+                PostgresType::Bytea => PostgresDecoder::Binary(BinaryDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                }),
+                PostgresType::List(ref inner) => {
+                    let (name, column) = inner;
+                    let inner_decoder = Box::new(PostgresDecoder::new(name, column));
+                    PostgresDecoder::List(ArrayDecoder {
+                        name: name.to_string(),
+                        arr: vec![],
+                        inner: inner_decoder,
+                    })
+                }
+                _ => unimplemented!(),
+            }
+    }
+
+    pub(crate) fn decode(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind> {
+        match *self {
+            PostgresDecoder::Boolean(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Int16(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Int32(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Int64(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Float32(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Float64(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Numeric(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::TimestampMicrosecond(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::TimestampTzMicrosecond(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Date32(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Time64Microsecond(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::DurationMicrosecond(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::String(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Binary(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::Jsonb(ref mut decoder) => decoder.decode(buf),
+            PostgresDecoder::List(ref mut decoder) => decoder.decode(buf),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn name(&self) -> String {
+        match *self {
+            PostgresDecoder::Boolean(ref decoder) => decoder.name(),
+            PostgresDecoder::Int16(ref decoder) => decoder.name(),
+            PostgresDecoder::Int32(ref decoder) => decoder.name(),
+            PostgresDecoder::Int64(ref decoder) => decoder.name(),
+            PostgresDecoder::Float32(ref decoder) => decoder.name(),
+            PostgresDecoder::Float64(ref decoder) => decoder.name(),
+            PostgresDecoder::Numeric(ref decoder) => decoder.name(),
+            PostgresDecoder::TimestampMicrosecond(ref decoder) => decoder.name(),
+            PostgresDecoder::TimestampTzMicrosecond(ref decoder) => decoder.name(),
+            PostgresDecoder::Date32(ref decoder) => decoder.name(),
+            PostgresDecoder::Time64Microsecond(ref decoder) => decoder.name(),
+            PostgresDecoder::DurationMicrosecond(ref decoder) => decoder.name(),
+            PostgresDecoder::String(ref decoder) => decoder.name(),
+            PostgresDecoder::Binary(ref decoder) => decoder.name(),
+            PostgresDecoder::Jsonb(ref decoder) => decoder.name(),
+            PostgresDecoder::List(ref decoder) => decoder.name(),
+        }
+    }
+
+    pub(crate) fn column_len(&self) -> usize {
+        match *self {
+            PostgresDecoder::Boolean(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Int16(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Int32(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Int64(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Float32(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Float64(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Numeric(ref decoder) => decoder.column_len(),
+            PostgresDecoder::TimestampMicrosecond(ref decoder) => decoder.column_len(),
+            PostgresDecoder::TimestampTzMicrosecond(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Date32(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Time64Microsecond(ref decoder) => decoder.column_len(),
+            PostgresDecoder::DurationMicrosecond(ref decoder) => decoder.column_len(),
+            PostgresDecoder::String(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Binary(ref decoder) => decoder.column_len(),
+            PostgresDecoder::Jsonb(ref decoder) => decoder.column_len(),
+            PostgresDecoder::List(ref decoder) => decoder.column_len(),
+        }
+    }
+
+    pub(crate) fn finish(&mut self, column_len: usize) -> ArrayRef {
+        match *self {
+            PostgresDecoder::Boolean(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Int16(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Int32(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Int64(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Float32(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Float64(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Numeric(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::TimestampMicrosecond(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::TimestampTzMicrosecond(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Date32(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Time64Microsecond(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::DurationMicrosecond(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::String(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Binary(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::Jsonb(ref mut decoder) => decoder.finish(column_len),
+            PostgresDecoder::List(ref mut decoder) => decoder.finish(column_len),
+        }
+    }
+
+    pub(crate) fn is_null(&self) -> bool {
+        match *self {
+            PostgresDecoder::Boolean(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Int16(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Int32(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Int64(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Float32(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Float64(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Numeric(ref decoder) => decoder.is_null(),
+            PostgresDecoder::TimestampMicrosecond(ref decoder) => decoder.is_null(),
+            PostgresDecoder::TimestampTzMicrosecond(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Date32(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Time64Microsecond(ref decoder) => decoder.is_null(),
+            PostgresDecoder::DurationMicrosecond(ref decoder) => decoder.is_null(),
+            PostgresDecoder::String(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Binary(ref decoder) => decoder.is_null(),
+            PostgresDecoder::Jsonb(ref decoder) => decoder.is_null(),
+            PostgresDecoder::List(ref decoder) => decoder.is_null(),
+        }
+    }
+}

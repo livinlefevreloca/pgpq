@@ -1,4 +1,4 @@
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType};
 use thiserror::Error;
 
 use crate::pg_schema::PostgresType;
@@ -40,6 +40,41 @@ pub enum ErrorKind {
     EncoderMissing { field: String },
     #[error("No fields match supplied encoder fields: {fields:?}")]
     UnknownFields { fields: Vec<String> },
+
+    // Decoding
+    #[error("Error decoding data: {reason}")]
+    Decode { reason: String, name: String },
+    #[error("Got invalid binary file header {bytes:?}")]
+    InvalidBinaryHeader { bytes: [u8; 11] },
+    #[error("Reached EOF in the middle of a tuple. partial tuple: {remaining_bytes:?}")]
+    IncompleteDecode { remaining_bytes: Vec<u8> },
+    #[error("Expected data size was not found")]
+    IncompleteData,
+    #[error("Invalid column specification: {spec}")]
+    InvalidColumnSpec { spec: String },
+    #[error("Invalid column type found while parsing schema: {typ}")]
+    UnsupportedColumnType { typ: String },
+    #[error("Got an error in an IO Operation: {io_error:?}")]
+    IOError { io_error: std::io::Error },
+    #[error("Got an error: {name} in Arrow while decoding: {reason}")]
+    ArrowErrorDecode { reason: String, name: String },
+    #[error("ArrowType: {typ:?} not currently supported for decoding")]
+    UnsupportedArrowType { typ: DataType },
+}
+
+impl From<std::io::Error> for ErrorKind {
+    fn from(io_error: std::io::Error) -> Self {
+        ErrorKind::IOError { io_error }
+    }
+}
+
+impl From<ArrowError> for ErrorKind {
+    fn from(arrow_error: ArrowError) -> Self {
+        ErrorKind::ArrowErrorDecode {
+            reason: arrow_error.to_string(),
+            name: "ArrowError".to_string(),
+        }
+    }
 }
 
 impl ErrorKind {
