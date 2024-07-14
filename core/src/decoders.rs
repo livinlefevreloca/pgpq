@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use arrow::compute::concat;
-use arrow::buffer::{OffsetBuffer, NullBuffer};
+use arrow::buffer::{OffsetBuffer, NullBuffer, BooleanBuffer};
 use arrow_schema::{DataType, Field};
 use arrow_array::builder::GenericByteBuilder;
 use arrow_array::types::GenericBinaryType;
@@ -207,6 +207,7 @@ macro_rules! impl_decode_variable_size {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct BooleanDecoder {
     name: String,
     arr: Vec<Option<bool>>,
@@ -214,6 +215,7 @@ pub struct BooleanDecoder {
 
 impl_decode!(BooleanDecoder, 1, |b: [u8; 1]| b[0] == 1, BooleanArray);
 
+#[derive(Debug)]
 pub struct Int16Decoder {
     name: String,
     arr: Vec<Option<i16>>,
@@ -221,6 +223,7 @@ pub struct Int16Decoder {
 
 impl_decode!(Int16Decoder, 2, i16::from_be_bytes, Int16Array);
 
+#[derive(Debug)]
 pub struct Int32Decoder {
     name: String,
     arr: Vec<Option<i32>>,
@@ -228,6 +231,7 @@ pub struct Int32Decoder {
 
 impl_decode!(Int32Decoder, 4, i32::from_be_bytes, Int32Array);
 
+#[derive(Debug)]
 pub struct Int64Decoder {
     name: String,
     arr: Vec<Option<i64>>,
@@ -235,6 +239,7 @@ pub struct Int64Decoder {
 
 impl_decode!(Int64Decoder, 8, i64::from_be_bytes, Int64Array);
 
+#[derive(Debug)]
 pub struct Float32Decoder {
     name: String,
     arr: Vec<Option<f32>>,
@@ -242,6 +247,7 @@ pub struct Float32Decoder {
 
 impl_decode!(Float32Decoder, 4, f32::from_be_bytes, Float32Array);
 
+#[derive(Debug)]
 pub struct Float64Decoder {
     name: String,
     arr: Vec<Option<f64>>,
@@ -263,6 +269,7 @@ fn convert_pg_timestamp_to_arrow_timestamp_microseconds(
         })
 }
 
+#[derive(Debug)]
 pub struct TimestampMicrosecondDecoder {
     name: String,
     arr: Vec<Option<i64>>,
@@ -278,6 +285,7 @@ impl_decode_fallible!(
     TimestampMicrosecondArray
 );
 
+#[derive(Debug)]
 pub struct TimestampTzMicrosecondDecoder {
     name: String,
     arr: Vec<Option<i64>>,
@@ -338,6 +346,7 @@ fn convert_pg_date_to_arrow_date(date: i32) -> Result<i32, ErrorKind> {
     })
 }
 
+#[derive(Debug)]
 pub struct Date32Decoder {
     name: String,
     arr: Vec<Option<i32>>,
@@ -353,6 +362,7 @@ impl_decode_fallible!(
     Date32Array
 );
 
+#[derive(Debug)]
 pub struct Time64MicrosecondDecoder {
     name: String,
     arr: Vec<Option<i64>>,
@@ -399,6 +409,7 @@ fn convert_pg_duration_to_arrow_duration(
         })?
 }
 
+#[derive(Debug)]
 pub struct DurationMicrosecondDecoder {
     name: String,
     arr: Vec<Option<i64>>,
@@ -417,6 +428,7 @@ impl_decode_fallible!(
     DurationMicrosecondArray
 );
 
+#[derive(Debug)]
 pub struct StringDecoder {
     name: String,
     arr: Vec<Option<String>>,
@@ -435,6 +447,7 @@ impl_decode_variable_size!(
     i32
 );
 
+#[derive(Debug)]
 pub struct BinaryDecoder {
     name: String,
     arr: Vec<Option<Vec<u8>>>,
@@ -484,6 +497,7 @@ impl Decoder for BinaryDecoder {
     }
 }
 
+#[derive(Debug)]
 pub struct JsonbDecoder {
     name: String,
     arr: Vec<Option<String>>,
@@ -638,6 +652,7 @@ fn truncate_and_finalize(mut v: Vec<u8>, scale: i16) -> String {
     String::from_utf8(v).unwrap()
 }
 
+#[derive(Debug)]
 pub struct NumericDecoder {
     name: String,
     arr: Vec<Option<String>>,
@@ -651,11 +666,13 @@ impl_decode_variable_size!(
     i32
 );
 
+#[derive(Debug)]
 pub struct ArrayDecoder {
     name: String,
     arr: Vec<ArrayRef>,
     inner: Box<PostgresDecoder>,
 }
+
 
 impl Decoder for ArrayDecoder {
     fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
@@ -673,7 +690,7 @@ impl Decoder for ArrayDecoder {
         for _ in 0..ndim {
             let dim = buf.consume_into_u32()?;
             dims.push(dim);
-            // consume the lbound whihc we dont need
+            // consume the lbound which we dont need
             buf.consume_into_u32()?;
         }
 
@@ -688,31 +705,56 @@ impl Decoder for ArrayDecoder {
         Ok(())
     }
 
-    fn finish(&mut self, column_len: usize) -> ArrayRef {
-        let data_type = self.arr[0].data_type();
-        let length = self.arr[0].len();
-
-        let mut offsets = vec![0; length + 1];
-        for i in 1..=length {
-            offsets[i] = offsets[i - 1] + self.arr[i - 1].len();
+    fn finish(&mut self, _column_len: usize) -> ArrayRef {
+        // Check if all the arrays are null and return a null array if so
+        if self.is_null() {
+            return Arc::new(NullArray::new(0)) as ArrayRef;
         }
 
-        let array_refs: Vec<& dyn Array> = self.arr.iter().map(|a| a.as_ref()).collect();
-        let nulls: Vec<Option<&NullBuffer>> = array_refs.iter().map(|a| a.nulls()).collect();
-        let arrays = concat(&array_refs).unwrap();
+        let arrays = std::mem::take(&mut self.arr);
 
-        let list_data = GenericListArray::<i32>::new(
-            Arc::new(Field::new("inner", data_type.clone(), true)),
-            OffsetBuffer::from_lengths(offsets),
-            arrays,
-            None,
-        );
+        // Build the offset buffer for the commbined ListArray using
+        // the lengths of the component arrays
+        let mut offset_values = vec![0 as i32];
+        for i in 1..arrays.len() + 1 {
+            offset_values.push(arrays[i - 1].len() as i32 + offset_values[i - 1]);
+        }
+        let offsets = OffsetBuffer::new(offset_values.into());
 
-        Arc::new(list_data) as ArrayRef
+        // Concatenate the data of the component arrays
+        // to create the child data of the ListArray
+        let array_refs: Vec<& dyn Array> = arrays.iter().filter(
+            |a| !matches!(a.data_type(), DataType::Null)
+        ).map(|a| a.as_ref()).collect();
+        let child_data = concat(&array_refs).unwrap();
+
+        // Calculate the null buffer for the ListArray
+        // by checking if the component arrays are null
+        let null_values = arrays.iter().map(|a| {
+            match a.data_type() {
+                DataType::Null => false,
+                _ => true,
+            }
+        }).collect::<Vec<bool>>();
+
+        // If there are no nulls, return None for the null buffer
+        let nulls = if null_values.iter().all(|v| *v) {
+            None
+        } else {
+            Some(NullBuffer::from(BooleanBuffer::from(null_values)))
+        };
+
+        // Construct the ListArray from parts
+        Arc::new(GenericListArray::new(
+            Arc::new(Field::new(self.name().replace("list_", ""), arrays[0].data_type().clone(), true)),
+            offsets,
+            child_data,
+            nulls,
+        )) as ArrayRef
     }
 
     fn is_null(&self) -> bool {
-        unimplemented!()
+        self.arr.iter().all(|a| matches!(a.data_type(), DataType::Null))
     }
 
     fn column_len(&self) -> usize {
@@ -722,11 +764,11 @@ impl Decoder for ArrayDecoder {
     fn name(&self) -> String {
         self.name.to_string()
     }
-
 }
 
 
 //
+#[derive(Debug)]
 pub enum PostgresDecoder {
     Boolean(BooleanDecoder),
     Int16(Int16Decoder),
@@ -822,7 +864,8 @@ impl PostgresDecoder {
                     arr: vec![],
                 }),
                 PostgresType::List(ref inner) => {
-                    let inner_decoder = Box::new(PostgresDecoder::new("inner", inner));
+                    let (name, column) = inner;
+                    let inner_decoder = Box::new(PostgresDecoder::new(name, column));
                     PostgresDecoder::List(ArrayDecoder {
                         name: name.to_string(),
                         arr: vec![],

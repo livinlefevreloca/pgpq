@@ -1123,9 +1123,9 @@ macro_rules! impl_list_encoder_builder {
             }
             fn schema(&self) -> Column {
                 Column {
-                    data_type: PostgresType::List(Box::new(
+                    data_type: PostgresType::List(("".to_string(), Box::new(
                         self.inner_encoder_builder.schema().clone(),
-                    )),
+                    ))),
                     nullable: self.field.is_nullable(),
                 }
             }

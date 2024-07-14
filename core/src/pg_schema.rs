@@ -27,7 +27,7 @@ pub enum PostgresType {
     Timestamp,
     TimestampTz(String),
     Interval,
-    List(Box<Column>),
+    List((String, Box<Column>)),
     Null,
 }
 
@@ -97,9 +97,9 @@ impl PostgresType {
             PostgresType::Timestamp => "TIMESTAMP".to_string(),
             PostgresType::TimestampTz(_) => "TIMESTAMP WITH ZONE".to_string(),
             PostgresType::Interval => "INTERVAL".to_string(),
-            PostgresType::List(inner) => {
+            PostgresType::List((_, column)) => {
                 // arrays of structs and such are not supported
-                let inner_tp = inner.data_type.name().unwrap();
+                let inner_tp = column.data_type.name().unwrap();
                 format!("{inner_tp}[]")
             }
             PostgresType::Null => "NULL".to_string(),
@@ -107,6 +107,11 @@ impl PostgresType {
         Some(v)
     }
 }
+
+
+impl PostgresType {
+}
+
 
 impl From<PostgresType> for DataType {
     fn from(pg_type: PostgresType) -> Self {
@@ -130,7 +135,14 @@ impl From<PostgresType> for DataType {
                 DataType::Timestamp(TimeUnit::Microsecond, Some(timezone.into()))
             }
             PostgresType::Interval => DataType::Duration(TimeUnit::Microsecond),
-            PostgresType::List(_) => unimplemented!(),
+            PostgresType::List((name, column)) => {
+                let name = name.replace("list_", "");
+                DataType::List(Arc::new(Field::new(
+                    &name,
+                    column.data_type.clone().into(),
+                    column.nullable,
+                )))
+            },
             PostgresType::Null => DataType::Null,
         }
     }
@@ -173,7 +185,7 @@ pub struct Column {
 }
 
 impl Column {
-    pub fn from_parts(type_str: &str, nullable: &str, timezone: String) -> Result<Self, ErrorKind> {
+    pub fn from_parts(name: &str, type_str: &str, nullable: &str, timezone: String) -> Result<Self, ErrorKind> {
         match type_str {
             "boolean" => Ok(Column {
                 data_type: PostgresType::Bool,
@@ -243,6 +255,15 @@ impl Column {
                 data_type: PostgresType::Interval,
                 nullable: nullable == "t",
             }),
+            typ if typ.ends_with("[]") => {
+                Ok(Column {
+                    data_type: PostgresType::List((name.to_string(), Box::new(Column {
+                        data_type: Column::from_parts(name, &typ[..typ.len() - 2], "f", timezone)?.data_type,
+                        nullable: true,
+                    }))),
+                    nullable: nullable == "t",
+                })
+            },
             _ => Err(ErrorKind::UnsupportedColumnType {
                 typ: type_str.to_string(),
             }),
@@ -311,7 +332,7 @@ impl PostgresSchema {
                 let name = parts[0];
                 let typ = parts[1];
                 let nullable = parts[2];
-                let col = Column::from_parts(typ, nullable, timezone.to_string())?;
+                let col = Column::from_parts(name, typ, nullable, timezone.to_string())?;
                 Ok((name.to_string(), col))
             })
             .collect::<Result<Vec<(String, Column)>, ErrorKind>>()
