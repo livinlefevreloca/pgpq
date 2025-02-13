@@ -85,7 +85,7 @@ impl ArrowToPostgresBinaryEncoder {
 }
 
 #[pymodule]
-fn _pgpq(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _pgpq(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ArrowToPostgresBinaryEncoder>()?;
     m.add_class::<crate::encoders::Int8EncoderBuilder>()?;
     m.add_class::<crate::encoders::ListEncoderBuilder>()?;

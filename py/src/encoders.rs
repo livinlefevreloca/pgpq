@@ -1,23 +1,25 @@
 use std::sync::Arc;
 
+
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_schema::Field;
 use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::PyRuntimeError;
-use pyo3::types::PyType;
+use pyo3::types::{PyType, PyNotImplemented};
 use pyo3::{exceptions::PyValueError, prelude::*};
 
 use pgpq::encoders::BuildEncoder;
 
 use crate::pg_schema::PostgresType;
+use crate::utils::{call_repr, PythonRepr};
 
 macro_rules! impl_passthrough_encoder_builder {
     ($py_class:ident) => {
         #[pymethods]
         impl $py_class {
             #[new]
-            fn new(py: Python, py_field: &PyAny) -> PyResult<Self> {
-                let field: Field = FromPyArrow::from_pyarrow(py_field)?;
+            fn new(_py: Python, py_field: &Bound<'_, PyAny>) -> PyResult<Self> {
+                let field = Field::from_pyarrow_bound(py_field)?;
                 let inner = match pgpq::encoders::EncoderBuilder::try_new(Arc::new(field)) {
                     Ok(inner) => inner,
                     Err(e) => {
@@ -29,7 +31,7 @@ macro_rules! impl_passthrough_encoder_builder {
                     }
                 };
                 Ok(Self {
-                    field: py_field.to_object(py),
+                    field: py_field.clone().into(),
                     inner,
                 })
             }
@@ -46,19 +48,19 @@ macro_rules! impl_passthrough_encoder_builder {
                 py: Python<'_>,
             ) -> PyResult<PyObject> {
                 let res = match op {
-                    CompareOp::Eq => (&self.inner == &other.inner).into_py(py),
-                    CompareOp::Ne => (&self.inner != &other.inner).into_py(py),
-                    _ => py.NotImplemented(),
+                    CompareOp::Eq => (self.inner == other.inner).into_pyobject(py)?.to_owned().into_any().unbind(),
+                    CompareOp::Ne => (self.inner != other.inner).into_pyobject(py)?.to_owned().into_any().unbind(),
+                    _ => PyNotImplemented::get(py).to_owned().into_any().unbind(),
                 };
                 Ok(res)
             }
         }
-        impl crate::utils::PythonRepr for $py_class {
+        impl PythonRepr for $py_class {
             fn py_repr(&self, py: Python) -> String {
                 format!(
                     "{}({})",
                     stringify!($py_class),
-                    &self.field.clone().into_ref(py).repr().unwrap(),
+                    call_repr(py, &self.field),
                 )
             }
         }
@@ -70,8 +72,8 @@ macro_rules! impl_passthrough_encoder_builder_variable_output {
         #[pymethods]
         impl $py_class {
             #[new]
-            fn new(py: Python, py_field: &PyAny) -> PyResult<Self> {
-                let field: Field = FromPyArrow::from_pyarrow(py_field)?;
+            fn new(_py: Python, py_field: &Bound<'_, PyAny>) -> PyResult<Self> {
+                let field = Field::from_pyarrow_bound(py_field)?;
                 let inner = match <$pgpq_encoder_builder>::new(Arc::new(field)) {
                     Ok(inner) => inner,
                     Err(e) => {
@@ -84,19 +86,19 @@ macro_rules! impl_passthrough_encoder_builder_variable_output {
                 };
                 let py_output: crate::pg_schema::PostgresType = inner.schema().data_type.into();
                 Ok(Self {
-                    field: py_field.to_object(py),
+                    field: py_field.clone().into(),
                     output: py_output,
                     inner: $pgpq_encoder_builder_enum_variant(inner),
                 })
             }
             #[classmethod]
             fn new_with_output(
-                cls: &PyType,
-                py: Python,
-                py_field: &PyAny,
+                cls: &Bound<'_, PyType>,
+                _py: Python,
+                py_field: &Bound<'_, PyAny>,
                 py_output: PostgresType,
             ) -> PyResult<Self> {
-                let field: Field = FromPyArrow::from_pyarrow(py_field)?;
+                let field = Field::from_pyarrow_bound(py_field)?;
                 let output = pgpq::pg_schema::PostgresType::from(py_output.clone());
                 let inner = match <$pgpq_encoder_builder>::new_with_output(Arc::new(field), output)
                 {
@@ -110,7 +112,7 @@ macro_rules! impl_passthrough_encoder_builder_variable_output {
                     }
                 };
                 Ok(Self {
-                    field: py_field.to_object(py),
+                    field: py_field.clone().into(),
                     output: py_output,
                     inner: $pgpq_encoder_builder_enum_variant(inner),
                 })
@@ -121,16 +123,16 @@ macro_rules! impl_passthrough_encoder_builder_variable_output {
             fn __str__(&self, py: Python) -> String {
                 self.__repr__(py)
             }
-            fn __richcmp__(
+            fn __richcmp__<'py>(
                 &self,
                 other: &Self,
                 op: CompareOp,
-                py: Python<'_>,
+                py: Python<'py>,
             ) -> PyResult<PyObject> {
                 let res = match op {
-                    CompareOp::Eq => (&self.inner == &other.inner).into_py(py),
-                    CompareOp::Ne => (&self.inner != &other.inner).into_py(py),
-                    _ => py.NotImplemented(),
+                    CompareOp::Eq => (self.inner == other.inner).into_pyobject(py)?.to_owned().into_any().unbind(),
+                    CompareOp::Ne => (self.inner != other.inner).into_pyobject(py)?.to_owned().into_any().unbind(),
+                    _ => PyNotImplemented::get(py).to_owned().into_any().unbind(),
                 };
                 Ok(res)
             }
@@ -140,7 +142,7 @@ macro_rules! impl_passthrough_encoder_builder_variable_output {
                 format!(
                     "{}({}, {})",
                     stringify!($py_class),
-                    &self.field.clone().into_ref(py).repr().unwrap(),
+                    crate::utils::call_repr(py, &self.field),
                     self.output.py_repr(py)
                 )
             }
@@ -149,7 +151,7 @@ macro_rules! impl_passthrough_encoder_builder_variable_output {
 }
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BooleanEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -157,7 +159,7 @@ pub struct BooleanEncoderBuilder {
 impl_passthrough_encoder_builder!(BooleanEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UInt8EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -165,7 +167,7 @@ pub struct UInt8EncoderBuilder {
 impl_passthrough_encoder_builder!(UInt8EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UInt16EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -173,7 +175,7 @@ pub struct UInt16EncoderBuilder {
 impl_passthrough_encoder_builder!(UInt16EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UInt32EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -181,7 +183,7 @@ pub struct UInt32EncoderBuilder {
 impl_passthrough_encoder_builder!(UInt32EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Int8EncoderBuilder {
     field: Py<PyAny>,
     output: PostgresType,
@@ -194,7 +196,7 @@ impl_passthrough_encoder_builder_variable_output!(
 );
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Int16EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -202,7 +204,7 @@ pub struct Int16EncoderBuilder {
 impl_passthrough_encoder_builder!(Int16EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Int32EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -210,7 +212,7 @@ pub struct Int32EncoderBuilder {
 impl_passthrough_encoder_builder!(Int32EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Int64EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -218,7 +220,7 @@ pub struct Int64EncoderBuilder {
 impl_passthrough_encoder_builder!(Int64EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Float16EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -226,7 +228,7 @@ pub struct Float16EncoderBuilder {
 impl_passthrough_encoder_builder!(Float16EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Float32EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -234,7 +236,7 @@ pub struct Float32EncoderBuilder {
 impl_passthrough_encoder_builder!(Float32EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Float64EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -242,7 +244,7 @@ pub struct Float64EncoderBuilder {
 impl_passthrough_encoder_builder!(Float64EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TimestampMicrosecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -250,7 +252,7 @@ pub struct TimestampMicrosecondEncoderBuilder {
 impl_passthrough_encoder_builder!(TimestampMicrosecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TimestampMillisecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -258,7 +260,7 @@ pub struct TimestampMillisecondEncoderBuilder {
 impl_passthrough_encoder_builder!(TimestampMillisecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TimestampSecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -266,7 +268,7 @@ pub struct TimestampSecondEncoderBuilder {
 impl_passthrough_encoder_builder!(TimestampSecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Date32EncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -274,7 +276,7 @@ pub struct Date32EncoderBuilder {
 impl_passthrough_encoder_builder!(Date32EncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Time32MillisecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -282,7 +284,7 @@ pub struct Time32MillisecondEncoderBuilder {
 impl_passthrough_encoder_builder!(Time32MillisecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Time32SecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -290,7 +292,7 @@ pub struct Time32SecondEncoderBuilder {
 impl_passthrough_encoder_builder!(Time32SecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Time64MicrosecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -298,7 +300,7 @@ pub struct Time64MicrosecondEncoderBuilder {
 impl_passthrough_encoder_builder!(Time64MicrosecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DurationMicrosecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -306,7 +308,7 @@ pub struct DurationMicrosecondEncoderBuilder {
 impl_passthrough_encoder_builder!(DurationMicrosecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DurationMillisecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -314,7 +316,7 @@ pub struct DurationMillisecondEncoderBuilder {
 impl_passthrough_encoder_builder!(DurationMillisecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DurationSecondEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -322,7 +324,7 @@ pub struct DurationSecondEncoderBuilder {
 impl_passthrough_encoder_builder!(DurationSecondEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StringEncoderBuilder {
     field: Py<PyAny>,
     output: crate::pg_schema::PostgresType,
@@ -335,7 +337,7 @@ impl_passthrough_encoder_builder_variable_output!(
 );
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LargeStringEncoderBuilder {
     field: Py<PyAny>,
     output: crate::pg_schema::PostgresType,
@@ -348,7 +350,7 @@ impl_passthrough_encoder_builder_variable_output!(
 );
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BinaryEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -356,7 +358,7 @@ pub struct BinaryEncoderBuilder {
 impl_passthrough_encoder_builder!(BinaryEncoderBuilder);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LargeBinaryEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -368,8 +370,8 @@ macro_rules! impl_list {
         #[pymethods]
         impl $struct {
             #[new]
-            fn new(py: Python, py_field: &PyAny) -> PyResult<Self> {
-                let field: Field = FromPyArrow::from_pyarrow(py_field)?;
+            fn new(_py: Python, py_field: Bound<'_, PyAny>) -> PyResult<Self> {
+                let field = Field::from_pyarrow_bound(&py_field)?;
                 let inner = match pgpq::encoders::EncoderBuilder::try_new(Arc::new(field)) {
                     Ok(inner) => inner,
                     Err(e) => {
@@ -381,22 +383,22 @@ macro_rules! impl_list {
                     }
                 };
                 Ok(Self {
-                    field: py_field.to_object(py),
+                    field: py_field.into(),
                     inner,
                 })
             }
             #[classmethod]
             fn new_with_inner(
-                _cls: &PyAny,
-                py: Python,
-                py_field: &PyAny,
+                _cls: &Bound<'_, PyType>,
+                _py: Python,
+                py_field: Bound<'_, PyAny>,
                 py_inner_encoder_builder: EncoderBuilder,
             ) -> PyResult<Self> {
-                let field: Field = FromPyArrow::from_pyarrow(py_field)?;
+                let field = Field::from_pyarrow_bound(&py_field)?;
                 let inner_encoder_builder: pgpq::encoders::EncoderBuilder =
                     py_inner_encoder_builder.into();
                 Ok(Self {
-                    field: py_field.to_object(py),
+                    field: py_field.into(),
                     inner: $encoder_builder_enum_variant(
                         $encoder_builder_new_with_inner(Arc::new(field), inner_encoder_builder)
                             .unwrap(),
@@ -416,9 +418,9 @@ macro_rules! impl_list {
                 py: Python<'_>,
             ) -> PyResult<PyObject> {
                 let res = match op {
-                    CompareOp::Eq => (&self.inner == &other.inner).into_py(py),
-                    CompareOp::Ne => (&self.inner != &other.inner).into_py(py),
-                    _ => py.NotImplemented(),
+                    CompareOp::Eq => (self.inner == other.inner).into_pyobject(py)?.to_owned().into_any().unbind(),
+                    CompareOp::Ne => (self.inner != other.inner).into_pyobject(py)?.to_owned().into_any().unbind(),
+                    _ => PyNotImplemented::get(py).to_owned().into_any().unbind(),
                 };
                 Ok(res)
             }
@@ -434,7 +436,7 @@ macro_rules! impl_list {
                 format!(
                     "{}({}, {})",
                     "ListEncoderBuilder",
-                    &self.field.clone().into_ref(py).repr().unwrap(),
+                    call_repr(py, &self.field),
                     inner_encoder_builder.py_repr(py),
                 )
             }
@@ -443,7 +445,7 @@ macro_rules! impl_list {
 }
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ListEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -455,7 +457,7 @@ impl_list!(
 );
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LargeListEncoderBuilder {
     field: Py<PyAny>,
     inner: pgpq::encoders::EncoderBuilder,
@@ -466,7 +468,7 @@ impl_list!(
     pgpq::encoders::LargeListEncoderBuilder::new_with_inner
 );
 
-#[derive(FromPyObject, Debug, Clone)]
+#[derive(FromPyObject, Debug)]
 pub enum EncoderBuilder {
     Boolean(BooleanEncoderBuilder),
     UInt8(UInt8EncoderBuilder),
@@ -532,8 +534,8 @@ impl crate::utils::PythonRepr for EncoderBuilder {
 }
 
 impl EncoderBuilder {
-    pub fn try_new(py: Python, py_field: &PyAny) -> PyResult<Self> {
-        let field: Field = FromPyArrow::from_pyarrow(py_field)?;
+    pub fn try_new(py: Python, py_field: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let field = Field::from_pyarrow_bound(py_field)?;
         let inner = match pgpq::encoders::EncoderBuilder::try_new(Arc::new(field)) {
             Ok(inner) => inner,
             Err(_e) => {

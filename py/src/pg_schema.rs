@@ -104,6 +104,10 @@ impl_simple!(Float8, pgpq::pg_schema::PostgresType::Float8);
 
 #[pyclass(module = "pgpq._pgpq")]
 #[derive(Debug, Clone, PartialEq)]
+pub struct Decimal;
+
+#[pyclass(module = "pgpq._pgpq")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Date;
 impl_simple!(Date, pgpq::pg_schema::PostgresType::Date);
 
@@ -181,6 +185,7 @@ pub enum PostgresType {
     Jsonb(Jsonb),
     Float4(Float4),
     Float8(Float8),
+    Decimal(Decimal),
     Date(Date),
     Time(Time),
     Timestamp(Timestamp),
@@ -202,6 +207,7 @@ impl From<PostgresType> for pgpq::pg_schema::PostgresType {
             PostgresType::Jsonb(inner) => inner.into(),
             PostgresType::Float4(inner) => inner.into(),
             PostgresType::Float8(inner) => inner.into(),
+            PostgresType::Decimal(inner) => inner.into(),
             PostgresType::Date(inner) => inner.into(),
             PostgresType::Time(inner) => inner.into(),
             PostgresType::Timestamp(inner) => inner.into(),
@@ -225,11 +231,12 @@ impl From<pgpq::pg_schema::PostgresType> for PostgresType {
             pgpq::pg_schema::PostgresType::Jsonb => PostgresType::Jsonb(Jsonb),
             pgpq::pg_schema::PostgresType::Float4 => PostgresType::Float4(Float4),
             pgpq::pg_schema::PostgresType::Float8 => PostgresType::Float8(Float8),
+            pgpq::pg_schema::PostgresType::Decimal => PostgresType::Decimal(Decimal),
             pgpq::pg_schema::PostgresType::Date => PostgresType::Date(Date),
             pgpq::pg_schema::PostgresType::Time => PostgresType::Time(Time),
             pgpq::pg_schema::PostgresType::Timestamp => PostgresType::Timestamp(Timestamp),
             pgpq::pg_schema::PostgresType::Interval => PostgresType::Interval(Interval),
-            pgpq::pg_schema::PostgresType::Decimal => todo!(),
+            pgpq::pg_schema::PostgresType::Decimal => PostgresType::Decimal(Decimal),
             pgpq::pg_schema::PostgresType::List(inner) => {
                 PostgresType::List(List::new((*inner).into()))
             }
@@ -251,6 +258,7 @@ impl PythonRepr for PostgresType {
             PostgresType::Jsonb(inner) => inner.py_repr(py),
             PostgresType::Float4(inner) => inner.py_repr(py),
             PostgresType::Float8(inner) => inner.py_repr(py),
+            PostgresType::Decimal(inner) => innber.py_repr(py),
             PostgresType::Date(inner) => inner.py_repr(py),
             PostgresType::Time(inner) => inner.py_repr(py),
             PostgresType::Timestamp(inner) => inner.py_repr(py),
@@ -291,6 +299,7 @@ impl Column {
             PostgresType::Jsonb(inner) => inner.clone().into_py(py),
             PostgresType::Float4(inner) => inner.clone().into_py(py),
             PostgresType::Float8(inner) => inner.clone().into_py(py),
+            PostgresType::Decimal(inner) => inner.clone().into_py(py),
             PostgresType::Date(inner) => inner.clone().into_py(py),
             PostgresType::Time(inner) => inner.clone().into_py(py),
             PostgresType::Timestamp(inner) => inner.clone().into_py(py),
