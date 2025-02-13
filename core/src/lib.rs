@@ -397,10 +397,27 @@ impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
         // Find the mininum length column in the decoders. These can be different if
         // we are in a partial consume state. We will truncate the columns to the length
         // of the shortest column and pick up the lost data in the next batch.
+        //
+        // For example: If on the current batch we were able to decode 3 rows in total
+        // but decoded the first and second column for a 4th rows we will truncate the
+        // third column to 3 rows.
+        //
+        //    column 1 | column 2 | column 3           column 1 | column 2 | column 3
+        //    ---------|----------|---------           ---------|----------|---------
+        //    1        | 2        | 3                  1        | 2        | 3
+        //    2        | 3        | 4          ->      2        | 3        | 4
+        //    3        | 4        | 5                  3        | 4        | 5
+        //    4        |          |
+        //
+        //
+        //  the truncated value will be not be lost because it will still be in the buffer
+        //  view on the next run. This is orchrstrated by the decode_batch method which
+        //  passes the number of bytes actually consumed to the caller.
         let column_len = self.decoders.iter().map(|d| d.column_len()).min().unwrap();
 
         // Determine which columns in the batch are fully null so that we can alter the schema
-        // to reflect this.
+        // to reflect this. Pyarrow stores all null columns in a more space efficient way.
+        // But the schema must be updated to indicate that the column is all nulls
         let null_columns = self
             .decoders
             .iter()

@@ -512,7 +512,7 @@ impl_decode_variable_size!(
         })
     },
     // Remove the first byte which is the version number
-    // https://www.postgresql.org/docs/13/datatype-json.html
+    // https://www.postgresql.org/docs/16/datatype-json.html
     1,
     GenericStringArray,
     i64
