@@ -1,7 +1,7 @@
 use crate::utils::PythonRepr;
 use pyo3::class::basic::CompareOp;
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::PyNotImplemented;
 
 macro_rules! impl_simple {
     ($struct:ident, $pg_type:path) => {
@@ -24,9 +24,17 @@ macro_rules! impl_simple {
                 py: Python<'_>,
             ) -> PyResult<PyObject> {
                 let res = match op {
-                    CompareOp::Eq => (self == other).into_py(py),
-                    CompareOp::Ne => (self != other).into_py(py),
-                    _ => py.NotImplemented(),
+                    CompareOp::Eq => (self == other)
+                        .into_pyobject(py)?
+                        .to_owned()
+                        .into_any()
+                        .unbind(),
+                    CompareOp::Ne => (self != other)
+                        .into_pyobject(py)?
+                        .to_owned()
+                        .into_any()
+                        .unbind(),
+                    _ => PyNotImplemented::get(py).to_owned().into_any().unbind(),
                 };
                 Ok(res)
             }
@@ -104,6 +112,11 @@ impl_simple!(Float8, pgpq::pg_schema::PostgresType::Float8);
 
 #[pyclass(module = "pgpq._pgpq")]
 #[derive(Debug, Clone, PartialEq)]
+pub struct Numeric;
+impl_simple!(Numeric, pgpq::pg_schema::PostgresType::Numeric);
+
+#[pyclass(module = "pgpq._pgpq")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Date;
 impl_simple!(Date, pgpq::pg_schema::PostgresType::Date);
 
@@ -125,14 +138,17 @@ impl_simple!(Interval, pgpq::pg_schema::PostgresType::Interval);
 #[pyclass(module = "pgpq._pgpq")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct List {
+    name: String,
     inner: Box<Column>,
 }
 
 #[pymethods]
 impl List {
     #[new]
-    fn new(inner: Column) -> Self {
+    #[pyo3(signature = (inner, name = "item".to_string()))]
+    fn new(inner: Column, name: String) -> Self {
         Self {
+            name,
             inner: Box::new(inner),
         }
     }
@@ -144,9 +160,17 @@ impl List {
     }
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> PyResult<PyObject> {
         let res = match op {
-            CompareOp::Eq => (self == other).into_py(py),
-            CompareOp::Ne => (self != other).into_py(py),
-            _ => py.NotImplemented(),
+            CompareOp::Eq => (self == other)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind(),
+            CompareOp::Ne => (self != other)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind(),
+            _ => PyNotImplemented::get(py).to_owned().into_any().unbind(),
         };
         Ok(res)
     }
@@ -157,7 +181,7 @@ impl List {
 
 impl From<List> for pgpq::pg_schema::PostgresType {
     fn from(val: List) -> Self {
-        pgpq::pg_schema::PostgresType::List(Box::new((*val.inner).into()))
+        pgpq::pg_schema::PostgresType::List((val.name, Box::new((*val.inner).into())))
     }
 }
 
@@ -181,6 +205,7 @@ pub enum PostgresType {
     Jsonb(Jsonb),
     Float4(Float4),
     Float8(Float8),
+    Numeric(Numeric),
     Date(Date),
     Time(Time),
     Timestamp(Timestamp),
@@ -202,6 +227,7 @@ impl From<PostgresType> for pgpq::pg_schema::PostgresType {
             PostgresType::Jsonb(inner) => inner.into(),
             PostgresType::Float4(inner) => inner.into(),
             PostgresType::Float8(inner) => inner.into(),
+            PostgresType::Numeric(inner) => inner.into(),
             PostgresType::Date(inner) => inner.into(),
             PostgresType::Time(inner) => inner.into(),
             PostgresType::Timestamp(inner) => inner.into(),
@@ -225,13 +251,15 @@ impl From<pgpq::pg_schema::PostgresType> for PostgresType {
             pgpq::pg_schema::PostgresType::Jsonb => PostgresType::Jsonb(Jsonb),
             pgpq::pg_schema::PostgresType::Float4 => PostgresType::Float4(Float4),
             pgpq::pg_schema::PostgresType::Float8 => PostgresType::Float8(Float8),
+            pgpq::pg_schema::PostgresType::Numeric => PostgresType::Numeric(Numeric),
             pgpq::pg_schema::PostgresType::Date => PostgresType::Date(Date),
             pgpq::pg_schema::PostgresType::Time => PostgresType::Time(Time),
             pgpq::pg_schema::PostgresType::Timestamp => PostgresType::Timestamp(Timestamp),
             pgpq::pg_schema::PostgresType::Interval => PostgresType::Interval(Interval),
-            pgpq::pg_schema::PostgresType::List(inner) => {
-                PostgresType::List(List::new((*inner).into()))
+            pgpq::pg_schema::PostgresType::List((name, inner)) => {
+                PostgresType::List(List::new((*inner).into(), name))
             }
+            _ => PostgresType::Text(Text),
         }
     }
 }
@@ -250,6 +278,7 @@ impl PythonRepr for PostgresType {
             PostgresType::Jsonb(inner) => inner.py_repr(py),
             PostgresType::Float4(inner) => inner.py_repr(py),
             PostgresType::Float8(inner) => inner.py_repr(py),
+            PostgresType::Numeric(inner) => inner.py_repr(py),
             PostgresType::Date(inner) => inner.py_repr(py),
             PostgresType::Time(inner) => inner.py_repr(py),
             PostgresType::Timestamp(inner) => inner.py_repr(py),
@@ -277,25 +306,27 @@ impl Column {
         }
     }
     #[getter]
-    fn get_data_type(&self, py: Python) -> Py<PyAny> {
-        match &self.data_type {
-            PostgresType::Bool(inner) => inner.clone().into_py(py),
-            PostgresType::Bytea(inner) => inner.clone().into_py(py),
-            PostgresType::Int2(inner) => inner.clone().into_py(py),
-            PostgresType::Int4(inner) => inner.clone().into_py(py),
-            PostgresType::Int8(inner) => inner.clone().into_py(py),
-            PostgresType::Char(inner) => inner.clone().into_py(py),
-            PostgresType::Text(inner) => inner.clone().into_py(py),
-            PostgresType::Json(inner) => inner.clone().into_py(py),
-            PostgresType::Jsonb(inner) => inner.clone().into_py(py),
-            PostgresType::Float4(inner) => inner.clone().into_py(py),
-            PostgresType::Float8(inner) => inner.clone().into_py(py),
-            PostgresType::Date(inner) => inner.clone().into_py(py),
-            PostgresType::Time(inner) => inner.clone().into_py(py),
-            PostgresType::Timestamp(inner) => inner.clone().into_py(py),
-            PostgresType::Interval(inner) => inner.clone().into_py(py),
-            PostgresType::List(inner) => inner.clone().into_py(py),
-        }
+    fn get_data_type(&self, py: Python) -> PyResult<PyObject> {
+        let obj = match &self.data_type {
+            PostgresType::Bool(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Bytea(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Int2(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Int4(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Int8(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Char(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Text(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Json(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Jsonb(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Float4(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Float8(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Numeric(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Date(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Time(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Timestamp(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Interval(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::List(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+        };
+        Ok(obj)
     }
     fn __repr__(&self, py: Python) -> String {
         self.py_repr(py)
@@ -305,9 +336,17 @@ impl Column {
     }
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> PyResult<PyObject> {
         let res = match op {
-            CompareOp::Eq => (self == other).into_py(py),
-            CompareOp::Ne => (self != other).into_py(py),
-            _ => py.NotImplemented(),
+            CompareOp::Eq => (self == other)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind(),
+            CompareOp::Ne => (self != other)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind(),
+            _ => PyNotImplemented::get(py).to_owned().into_any().unbind(),
         };
         Ok(res)
     }
@@ -358,9 +397,17 @@ impl PostgresSchema {
     }
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> PyResult<PyObject> {
         let res = match op {
-            CompareOp::Eq => (self == other).into_py(py),
-            CompareOp::Ne => (self != other).into_py(py),
-            _ => py.NotImplemented(),
+            CompareOp::Eq => (self == other)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind(),
+            CompareOp::Ne => (self != other)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind(),
+            _ => PyNotImplemented::get(py).to_owned().into_any().unbind(),
         };
         Ok(res)
     }
@@ -392,19 +439,13 @@ impl From<PostgresSchema> for pgpq::pg_schema::PostgresSchema {
 
 impl PythonRepr for PostgresSchema {
     fn py_repr(&self, py: Python) -> String {
-        let columns: Vec<(String, Py<PyAny>)> = self
+        let columns: Vec<String> = self
             .columns
             .iter()
             .map(|(f_name, col)| {
-                (
-                    f_name.clone(),
-                    Py::new(py, col.clone()).unwrap().into_ref(py).into(),
-                )
+                format!("('{}', {})", f_name, col.py_repr(py))
             })
             .collect();
-        format!(
-            "PostgresSchema({})",
-            PyList::new(py, columns).repr().unwrap()
-        )
+        format!("PostgresSchema([{}])", columns.join(", "))
     }
 }
