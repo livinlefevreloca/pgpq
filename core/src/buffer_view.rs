@@ -30,19 +30,6 @@ impl BufferView<'_> {
         Ok(res)
     }
 
-    pub fn consume_into_u16(&mut self) -> Result<u16, ErrorKind> {
-        if self.consumed + 2 > self.inner.len() {
-            return Err(ErrorKind::IncompleteData);
-        }
-        let res = u16::from_be_bytes(
-            self.inner[self.consumed..self.consumed + 2]
-                .try_into()
-                .unwrap(),
-        );
-        self.consumed += 2;
-        Ok(res)
-    }
-
     pub fn consume_into_vec_n(&mut self, n: usize) -> Result<Vec<u8>, ErrorKind> {
         if self.consumed + n > self.inner.len() {
             return Err(ErrorKind::IncompleteData);
@@ -57,10 +44,6 @@ impl BufferView<'_> {
 
     pub fn remaining(&self) -> usize {
         self.inner.len() - self.consumed
-    }
-
-    pub fn consumed(&self) -> usize {
-        self.consumed
     }
 
     pub fn swallow(&mut self, n: usize) {

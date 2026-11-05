@@ -2,13 +2,11 @@ from __future__ import annotations
 
 from glob import glob
 from pathlib import Path
-from typing import Any, Iterator, List, Tuple
+from typing import Any, List, Tuple
 
 import pyarrow as pa
 import pyarrow.ipc as paipc
 import pytest
-from testing.postgresql import Postgresql
-import psycopg
 
 import pgpq.schema
 import pgpq.encoders
@@ -16,19 +14,7 @@ from pgpq import ArrowToPostgresBinaryEncoder
 from pgpq.schema import PostgresSchema
 
 
-@pytest.fixture(scope="session")
-def postgres():
-    return Postgresql()
-
-
-Connection = psycopg.Connection[Tuple[Any, ...]]
-
-
-@pytest.fixture(scope="session")
-def dbconn(postgres: Postgresql) -> Iterator[Connection]:
-    print(postgres.url())
-    with psycopg.connect(str(postgres.url())) as conn:
-        yield conn
+from test_pgpq.conftest import Connection
 
 
 def copy_buffer_and_get_rows(

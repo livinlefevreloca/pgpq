@@ -48,6 +48,20 @@ pub enum ErrorKind {
     InvalidBinaryHeader { bytes: [u8; 11] },
     #[error("Reached EOF in the middle of a tuple. partial tuple: {remaining_bytes:?}")]
     IncompleteDecode { remaining_bytes: Vec<u8> },
+    #[error("The stream ended without the COPY trailer")]
+    MissingTrailer,
+    #[error("Data followed the COPY trailer")]
+    DataAfterTrailer,
+    #[error("A row has {actual} fields but the schema has {expected} columns")]
+    UnexpectedFieldCount { expected: usize, actual: i16 },
+    #[error("Malformed row: {reason}")]
+    MalformedRow { reason: String },
+    #[error("Unsupported COPY header flags {flags:#x}; rows with OIDs are not supported")]
+    UnsupportedHeaderFlags { flags: u32 },
+    #[error("The batch size must be at least one row")]
+    InvalidBatchSize,
+    #[error("The decoder already failed and cannot accept more data")]
+    DecoderFailed,
     #[error("Expected data size was not found")]
     IncompleteData,
     #[error("Invalid column specification: {spec}")]
