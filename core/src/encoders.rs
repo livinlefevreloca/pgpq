@@ -10,7 +10,10 @@ use crate::error::ErrorKind;
 use crate::pg_schema::{Column, PostgresType, TypeSize};
 
 #[inline]
-pub(crate) fn downcast_checked<'a, T: 'static>(arr: &'a dyn Array, field: &str) -> Result<&'a T, ErrorKind> {
+pub(crate) fn downcast_checked<'a, T: 'static>(
+    arr: &'a dyn Array,
+    field: &str,
+) -> Result<&'a T, ErrorKind> {
     match arr.as_any().downcast_ref::<T>() {
         Some(v) => Ok(v),
         None => Err(ErrorKind::mismatched_column_type(
@@ -1123,9 +1126,10 @@ macro_rules! impl_list_encoder_builder {
             }
             fn schema(&self) -> Column {
                 Column {
-                    data_type: PostgresType::List(("".to_string(), Box::new(
-                        self.inner_encoder_builder.schema().clone(),
-                    ))),
+                    data_type: PostgresType::List((
+                        "".to_string(),
+                        Box::new(self.inner_encoder_builder.schema().clone()),
+                    )),
                     nullable: self.field.is_nullable(),
                 }
             }

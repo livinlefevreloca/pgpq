@@ -1,5 +1,5 @@
-use std::fmt::Debug;
 use crate::error::ErrorKind;
+use std::fmt::Debug;
 
 pub(crate) struct BufferView<'a> {
     inner: &'a [u8],
@@ -67,4 +67,3 @@ impl BufferView<'_> {
         self.consumed += n;
     }
 }
-

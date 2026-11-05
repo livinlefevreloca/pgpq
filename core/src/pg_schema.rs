@@ -108,10 +108,7 @@ impl PostgresType {
     }
 }
 
-
-impl PostgresType {
-}
-
+impl PostgresType {}
 
 impl From<PostgresType> for DataType {
     fn from(pg_type: PostgresType) -> Self {
@@ -142,12 +139,11 @@ impl From<PostgresType> for DataType {
                     column.data_type.clone().into(),
                     column.nullable,
                 )))
-            },
+            }
             PostgresType::Null => DataType::Null,
         }
     }
 }
-
 
 impl TryFrom<DataType> for PostgresType {
     type Error = ErrorKind;
@@ -185,7 +181,12 @@ pub struct Column {
 }
 
 impl Column {
-    pub fn from_parts(name: &str, type_str: &str, nullable: &str, timezone: String) -> Result<Self, ErrorKind> {
+    pub fn from_parts(
+        name: &str,
+        type_str: &str,
+        nullable: &str,
+        timezone: String,
+    ) -> Result<Self, ErrorKind> {
         match type_str {
             "boolean" => Ok(Column {
                 data_type: PostgresType::Bool,
@@ -255,15 +256,17 @@ impl Column {
                 data_type: PostgresType::Interval,
                 nullable: nullable == "t",
             }),
-            typ if typ.ends_with("[]") => {
-                Ok(Column {
-                    data_type: PostgresType::List((name.to_string(), Box::new(Column {
-                        data_type: Column::from_parts(name, &typ[..typ.len() - 2], "f", timezone)?.data_type,
+            typ if typ.ends_with("[]") => Ok(Column {
+                data_type: PostgresType::List((
+                    name.to_string(),
+                    Box::new(Column {
+                        data_type: Column::from_parts(name, &typ[..typ.len() - 2], "f", timezone)?
+                            .data_type,
                         nullable: true,
-                    }))),
-                    nullable: nullable == "t",
-                })
-            },
+                    }),
+                )),
+                nullable: nullable == "t",
+            }),
             _ => Err(ErrorKind::UnsupportedColumnType {
                 typ: type_str.to_string(),
             }),

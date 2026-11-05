@@ -7,14 +7,14 @@ use arrow_schema::Schema;
 use bytes::{Buf, BufMut, BytesMut};
 use error::ErrorKind;
 
+mod buffer_view;
 pub mod decoders;
 pub mod encoders;
 pub mod error;
 pub mod pg_schema;
-mod buffer_view;
 
-use crate::decoders::{PostgresDecoder, create_decoders};
 use crate::buffer_view::BufferView;
+use crate::decoders::{create_decoders, PostgresDecoder};
 use crate::encoders::{BuildEncoder, Encode, EncoderBuilder};
 use crate::pg_schema::PostgresSchema;
 
@@ -433,7 +433,10 @@ impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
             .map(|decoder| decoder.finish(column_len))
             .collect();
 
-        Ok(RecordBatch::try_new(self.schema.clone().nullify_columns(&null_columns).into(), columns)?)
+        Ok(RecordBatch::try_new(
+            self.schema.clone().nullify_columns(&null_columns).into(),
+            columns,
+        )?)
     }
 }
 

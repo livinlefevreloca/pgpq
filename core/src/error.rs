@@ -42,7 +42,7 @@ pub enum ErrorKind {
     UnknownFields { fields: Vec<String> },
 
     // Decoding
-    #[error("Error decoding data: {reason}")]
+    #[error("Error decoding column {name}: {reason}")]
     Decode { reason: String, name: String },
     #[error("Got invalid binary file header {bytes:?}")]
     InvalidBinaryHeader { bytes: [u8; 11] },

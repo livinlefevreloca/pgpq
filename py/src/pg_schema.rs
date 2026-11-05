@@ -450,9 +450,7 @@ impl PythonRepr for PostgresSchema {
         let columns: Vec<String> = self
             .columns
             .iter()
-            .map(|(f_name, col)| {
-                format!("('{}', {})", f_name, col.py_repr(py))
-            })
+            .map(|(f_name, col)| format!("('{}', {})", f_name, col.py_repr(py)))
             .collect();
         format!("PostgresSchema([{}])", columns.join(", "))
     }

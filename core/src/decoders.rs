@@ -1,23 +1,22 @@
 #![allow(clippy::redundant_closure_call)]
 
-use std::sync::Arc;
+use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow::compute::concat;
-use arrow::buffer::{OffsetBuffer, NullBuffer, BooleanBuffer};
-use arrow_schema::{DataType, Field};
 use arrow_array::builder::GenericByteBuilder;
 use arrow_array::types::GenericBinaryType;
-use arrow_array::{self, ArrayRef, Array};
+use arrow_array::{self, Array, ArrayRef};
 use arrow_array::{
     BooleanArray, Date32Array, DurationMicrosecondArray, Float32Array, Float64Array,
-    GenericStringArray, Int16Array, Int32Array, Int64Array, Time64MicrosecondArray,
-    TimestampMicrosecondArray, NullArray, GenericListArray
+    GenericListArray, GenericStringArray, Int16Array, Int32Array, Int64Array, NullArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray,
 };
+use arrow_schema::{DataType, Field};
+use std::sync::Arc;
 
+use crate::buffer_view::BufferView;
 use crate::encoders::{PG_BASE_DATE_OFFSET, PG_BASE_TIMESTAMP_OFFSET_US};
 use crate::error::ErrorKind;
-use crate::buffer_view::BufferView;
-use crate::pg_schema::{PostgresSchema, PostgresType, Column};
-
+use crate::pg_schema::{Column, PostgresSchema, PostgresType};
 
 /// Trait defining the methods needed to decode a Postgres type into an Arrow array
 pub(crate) trait Decoder {
@@ -27,7 +26,6 @@ pub(crate) trait Decoder {
     fn name(&self) -> String;
     fn is_null(&self) -> bool;
 }
-
 
 macro_rules! impl_decode {
     ($struct_name:ident, $size:expr, $transform:expr, $array_kind:ident) => {
@@ -601,7 +599,6 @@ fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
             decimal.push(dig as u8 + b'0');
             digits_index += 1;
         }
-
     }
     // If scale is > 0 we have digits after the decimal point
     if scale > 0 {
@@ -634,20 +631,17 @@ fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
 /// If the number ends in a decimal point, add a zero
 fn truncate_and_finalize(mut v: Vec<u8>, scale: i16) -> String {
     // if there is a decimal point do some general cleanup
-    let decimal_point_idx =  v.iter().position(|&c| c == b'.');
-    match decimal_point_idx {
-        Some(idx) => {
-            // If the number ends in a decimal point, add a zero
-            if idx == v.len() - 1 {
-                v.push(b'0')
-            // Strip any trailing zeros after the decimal point
-            } else {
-                while v.len() - idx - 1 > scale as usize {
-                    v.pop();
-                }
+    let decimal_point_idx = v.iter().position(|&c| c == b'.');
+    if let Some(idx) = decimal_point_idx {
+        // If the number ends in a decimal point, add a zero
+        if idx == v.len() - 1 {
+            v.push(b'0')
+        // Strip any trailing zeros after the decimal point
+        } else {
+            while v.len() - idx - 1 > scale as usize {
+                v.pop();
             }
-        },
-        None => {}
+        }
     };
     String::from_utf8(v).unwrap()
 }
@@ -672,7 +666,6 @@ pub struct ArrayDecoder {
     arr: Vec<ArrayRef>,
     inner: Box<PostgresDecoder>,
 }
-
 
 impl Decoder for ArrayDecoder {
     fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
@@ -715,7 +708,7 @@ impl Decoder for ArrayDecoder {
 
         // Build the offset buffer for the commbined ListArray using
         // the lengths of the component arrays
-        let mut offset_values = vec![0 as i32];
+        let mut offset_values = vec![0_i32];
         for i in 1..arrays.len() + 1 {
             offset_values.push(arrays[i - 1].len() as i32 + offset_values[i - 1]);
         }
@@ -723,19 +716,19 @@ impl Decoder for ArrayDecoder {
 
         // Concatenate the data of the component arrays
         // to create the child data of the ListArray
-        let array_refs: Vec<& dyn Array> = arrays.iter().filter(
-            |a| !matches!(a.data_type(), DataType::Null)
-        ).map(|a| a.as_ref()).collect();
+        let array_refs: Vec<&dyn Array> = arrays
+            .iter()
+            .filter(|a| !matches!(a.data_type(), DataType::Null))
+            .map(|a| a.as_ref())
+            .collect();
         let child_data = concat(&array_refs).unwrap();
 
         // Calculate the null buffer for the ListArray
         // by checking if the component arrays are null
-        let null_values = arrays.iter().map(|a| {
-            match a.data_type() {
-                DataType::Null => false,
-                _ => true,
-            }
-        }).collect::<Vec<bool>>();
+        let null_values = arrays
+            .iter()
+            .map(|a| !matches!(a.data_type(), DataType::Null))
+            .collect::<Vec<bool>>();
 
         // If there are no nulls, return None for the null buffer
         let nulls = if null_values.iter().all(|v| *v) {
@@ -746,7 +739,11 @@ impl Decoder for ArrayDecoder {
 
         // Construct the ListArray from parts
         Arc::new(GenericListArray::new(
-            Arc::new(Field::new(self.name().replace("list_", ""), arrays[0].data_type().clone(), true)),
+            Arc::new(Field::new(
+                self.name().replace("list_", ""),
+                arrays[0].data_type().clone(),
+                true,
+            )),
             offsets,
             child_data,
             nulls,
@@ -754,7 +751,9 @@ impl Decoder for ArrayDecoder {
     }
 
     fn is_null(&self) -> bool {
-        self.arr.iter().all(|a| matches!(a.data_type(), DataType::Null))
+        self.arr
+            .iter()
+            .all(|a| matches!(a.data_type(), DataType::Null))
     }
 
     fn column_len(&self) -> usize {
@@ -765,7 +764,6 @@ impl Decoder for ArrayDecoder {
         self.name.to_string()
     }
 }
-
 
 //
 #[derive(Debug)]
@@ -788,92 +786,92 @@ pub enum PostgresDecoder {
     List(ArrayDecoder),
 }
 
-
-
-
 pub(crate) fn create_decoders(schema: &PostgresSchema) -> Vec<PostgresDecoder> {
-    schema.iter().map(|(name, column)| PostgresDecoder::new(name, column)).collect()
+    schema
+        .iter()
+        .map(|(name, column)| PostgresDecoder::new(name, column))
+        .collect()
 }
 
 impl PostgresDecoder {
     pub fn new(name: &str, column: &Column) -> Self {
         match column.data_type {
-                PostgresType::Bool => PostgresDecoder::Boolean(BooleanDecoder {
+            PostgresType::Bool => PostgresDecoder::Boolean(BooleanDecoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Int2 => PostgresDecoder::Int16(Int16Decoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Int4 => PostgresDecoder::Int32(Int32Decoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Int8 => PostgresDecoder::Int64(Int64Decoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Float4 => PostgresDecoder::Float32(Float32Decoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Float8 => PostgresDecoder::Float64(Float64Decoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Numeric => PostgresDecoder::Numeric(NumericDecoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Timestamp => {
+                PostgresDecoder::TimestampMicrosecond(TimestampMicrosecondDecoder {
                     name: name.to_string(),
                     arr: vec![],
-                }),
-                PostgresType::Int2 => PostgresDecoder::Int16(Int16Decoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::Int4 => PostgresDecoder::Int32(Int32Decoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::Int8 => PostgresDecoder::Int64(Int64Decoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::Float4 => PostgresDecoder::Float32(Float32Decoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::Float8 => PostgresDecoder::Float64(Float64Decoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::Numeric => PostgresDecoder::Numeric(NumericDecoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::Timestamp => {
-                    PostgresDecoder::TimestampMicrosecond(TimestampMicrosecondDecoder {
-                        name: name.to_string(),
-                        arr: vec![],
-                    })
-                }
-                PostgresType::TimestampTz(ref timezone) => {
-                    PostgresDecoder::TimestampTzMicrosecond(TimestampTzMicrosecondDecoder {
-                        name: name.to_string(),
-                        arr: vec![],
-                        timezone: timezone.to_string(),
-                    })
-                }
-                PostgresType::Date => PostgresDecoder::Date32(Date32Decoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::Time => PostgresDecoder::Time64Microsecond(Time64MicrosecondDecoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::Interval => {
-                    PostgresDecoder::DurationMicrosecond(DurationMicrosecondDecoder {
-                        name: name.to_string(),
-                        arr: vec![],
-                    })
-                }
-                PostgresType::Text | PostgresType::Char | PostgresType::Json => {
-                    PostgresDecoder::String(StringDecoder {
-                        name: name.to_string(),
-                        arr: vec![],
-                    })
-                }
-                PostgresType::Bytea => PostgresDecoder::Binary(BinaryDecoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                }),
-                PostgresType::List(ref inner) => {
-                    let (name, column) = inner;
-                    let inner_decoder = Box::new(PostgresDecoder::new(name, column));
-                    PostgresDecoder::List(ArrayDecoder {
-                        name: name.to_string(),
-                        arr: vec![],
-                        inner: inner_decoder,
-                    })
-                }
-                _ => unimplemented!(),
+                })
             }
+            PostgresType::TimestampTz(ref timezone) => {
+                PostgresDecoder::TimestampTzMicrosecond(TimestampTzMicrosecondDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                    timezone: timezone.to_string(),
+                })
+            }
+            PostgresType::Date => PostgresDecoder::Date32(Date32Decoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Time => PostgresDecoder::Time64Microsecond(Time64MicrosecondDecoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::Interval => {
+                PostgresDecoder::DurationMicrosecond(DurationMicrosecondDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                })
+            }
+            PostgresType::Text | PostgresType::Char | PostgresType::Json => {
+                PostgresDecoder::String(StringDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                })
+            }
+            PostgresType::Bytea => PostgresDecoder::Binary(BinaryDecoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
+            PostgresType::List(ref inner) => {
+                let (name, column) = inner;
+                let inner_decoder = Box::new(PostgresDecoder::new(name, column));
+                PostgresDecoder::List(ArrayDecoder {
+                    name: name.to_string(),
+                    arr: vec![],
+                    inner: inner_decoder,
+                })
+            }
+            _ => unimplemented!(),
+        }
     }
 
     pub(crate) fn decode(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind> {

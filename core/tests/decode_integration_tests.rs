@@ -87,9 +87,15 @@ fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
             .collect::<Vec<_>>();
     }
 
-    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), expected_batches.iter().map(|b| b.num_rows()).sum::<usize>());
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        expected_batches.iter().map(|b| b.num_rows()).sum::<usize>()
+    );
     let batch_schemas = batches.iter().map(|b| b.schema()).collect::<Vec<_>>();
-    let expected_batch_schemas = expected_batches.iter().map(|b| b.schema()).collect::<Vec<_>>();
+    let expected_batch_schemas = expected_batches
+        .iter()
+        .map(|b| b.schema())
+        .collect::<Vec<_>>();
     assert_eq!(batch_schemas, expected_batch_schemas);
     assert_eq!(batches, expected_batches);
 
@@ -268,7 +274,6 @@ fn test_numeric_nullable() -> Result<(), ErrorKind> {
 
 // Nested types non-nullable
 
-
 #[test]
 fn test_list_int16() -> Result<(), ErrorKind> {
     run_test_case("list_int16", "America/New_York".to_string())?;
@@ -394,13 +399,19 @@ fn test_list_float64_nullable() -> Result<(), ErrorKind> {
 
 #[test]
 fn test_list_timestamp_us_notz_nullable() -> Result<(), ErrorKind> {
-    run_test_case("list_timestamp_us_notz_nullable", "America/New_York".to_string())?;
+    run_test_case(
+        "list_timestamp_us_notz_nullable",
+        "America/New_York".to_string(),
+    )?;
     Ok(())
 }
 
 #[test]
 fn test_list_timestamp_us_tz_nullable() -> Result<(), ErrorKind> {
-    run_test_case("list_timestamp_us_tz_nullable", "America/New_York".to_string())?;
+    run_test_case(
+        "list_timestamp_us_tz_nullable",
+        "America/New_York".to_string(),
+    )?;
     Ok(())
 }
 

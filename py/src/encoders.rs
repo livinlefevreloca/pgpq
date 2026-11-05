@@ -64,11 +64,7 @@ macro_rules! impl_passthrough_encoder_builder {
         }
         impl PythonRepr for $py_class {
             fn py_repr(&self, py: Python) -> String {
-                format!(
-                    "{}({})",
-                    stringify!($py_class),
-                    call_repr(py, &self.field),
-                )
+                format!("{}({})", stringify!($py_class), call_repr(py, &self.field),)
             }
         }
     };
@@ -814,33 +810,133 @@ macro_rules! convert_encoder_builder {
 impl From<pgpq::encoders::EncoderBuilder> for EncoderBuilder {
     fn from(value: pgpq::encoders::EncoderBuilder) -> Self {
         Python::with_gil(|py| match &value {
-            pgpq::encoders::EncoderBuilder::Boolean(inner) => convert_encoder_builder!(py, inner, value, Boolean, BooleanEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::UInt8(inner) => convert_encoder_builder!(py, inner, value, UInt8, UInt8EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::UInt16(inner) => convert_encoder_builder!(py, inner, value, UInt16, UInt16EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::UInt32(inner) => convert_encoder_builder!(py, inner, value, UInt32, UInt32EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Int8(inner) => convert_encoder_builder!(py, inner, value, Int8, Int8EncoderBuilder, with_output),
-            pgpq::encoders::EncoderBuilder::Int16(inner) => convert_encoder_builder!(py, inner, value, Int16, Int16EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Int32(inner) => convert_encoder_builder!(py, inner, value, Int32, Int32EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Int64(inner) => convert_encoder_builder!(py, inner, value, Int64, Int64EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Float16(inner) => convert_encoder_builder!(py, inner, value, Float16, Float16EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Float32(inner) => convert_encoder_builder!(py, inner, value, Float32, Float32EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Float64(inner) => convert_encoder_builder!(py, inner, value, Float64, Float64EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::TimestampMicrosecond(inner) => convert_encoder_builder!(py, inner, value, TimestampMicrosecond, TimestampMicrosecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::TimestampMillisecond(inner) => convert_encoder_builder!(py, inner, value, TimestampMillisecond, TimestampMillisecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::TimestampSecond(inner) => convert_encoder_builder!(py, inner, value, TimestampSecond, TimestampSecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Date32(inner) => convert_encoder_builder!(py, inner, value, Date32, Date32EncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Time32Millisecond(inner) => convert_encoder_builder!(py, inner, value, Time32Millisecond, Time32MillisecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Time32Second(inner) => convert_encoder_builder!(py, inner, value, Time32Second, Time32SecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::Time64Microsecond(inner) => convert_encoder_builder!(py, inner, value, Time64Microsecond, Time64MicrosecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::DurationMicrosecond(inner) => convert_encoder_builder!(py, inner, value, DurationMicrosecond, DurationMicrosecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::DurationMillisecond(inner) => convert_encoder_builder!(py, inner, value, DurationMillisecond, DurationMillisecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::DurationSecond(inner) => convert_encoder_builder!(py, inner, value, DurationSecond, DurationSecondEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::String(inner) => convert_encoder_builder!(py, inner, value, String, StringEncoderBuilder, with_output),
-            pgpq::encoders::EncoderBuilder::LargeString(inner) => convert_encoder_builder!(py, inner, value, LargeString, LargeStringEncoderBuilder, with_output),
-            pgpq::encoders::EncoderBuilder::Binary(inner) => convert_encoder_builder!(py, inner, value, Binary, BinaryEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::LargeBinary(inner) => convert_encoder_builder!(py, inner, value, LargeBinary, LargeBinaryEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::List(inner) => convert_encoder_builder!(py, inner, value, List, ListEncoderBuilder),
-            pgpq::encoders::EncoderBuilder::LargeList(inner) => convert_encoder_builder!(py, inner, value, LargeList, LargeListEncoderBuilder),
+            pgpq::encoders::EncoderBuilder::Boolean(inner) => {
+                convert_encoder_builder!(py, inner, value, Boolean, BooleanEncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::UInt8(inner) => {
+                convert_encoder_builder!(py, inner, value, UInt8, UInt8EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::UInt16(inner) => {
+                convert_encoder_builder!(py, inner, value, UInt16, UInt16EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::UInt32(inner) => {
+                convert_encoder_builder!(py, inner, value, UInt32, UInt32EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::Int8(inner) => {
+                convert_encoder_builder!(py, inner, value, Int8, Int8EncoderBuilder, with_output)
+            }
+            pgpq::encoders::EncoderBuilder::Int16(inner) => {
+                convert_encoder_builder!(py, inner, value, Int16, Int16EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::Int32(inner) => {
+                convert_encoder_builder!(py, inner, value, Int32, Int32EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::Int64(inner) => {
+                convert_encoder_builder!(py, inner, value, Int64, Int64EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::Float16(inner) => {
+                convert_encoder_builder!(py, inner, value, Float16, Float16EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::Float32(inner) => {
+                convert_encoder_builder!(py, inner, value, Float32, Float32EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::Float64(inner) => {
+                convert_encoder_builder!(py, inner, value, Float64, Float64EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::TimestampMicrosecond(inner) => {
+                convert_encoder_builder!(
+                    py,
+                    inner,
+                    value,
+                    TimestampMicrosecond,
+                    TimestampMicrosecondEncoderBuilder
+                )
+            }
+            pgpq::encoders::EncoderBuilder::TimestampMillisecond(inner) => {
+                convert_encoder_builder!(
+                    py,
+                    inner,
+                    value,
+                    TimestampMillisecond,
+                    TimestampMillisecondEncoderBuilder
+                )
+            }
+            pgpq::encoders::EncoderBuilder::TimestampSecond(inner) => convert_encoder_builder!(
+                py,
+                inner,
+                value,
+                TimestampSecond,
+                TimestampSecondEncoderBuilder
+            ),
+            pgpq::encoders::EncoderBuilder::Date32(inner) => {
+                convert_encoder_builder!(py, inner, value, Date32, Date32EncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::Time32Millisecond(inner) => convert_encoder_builder!(
+                py,
+                inner,
+                value,
+                Time32Millisecond,
+                Time32MillisecondEncoderBuilder
+            ),
+            pgpq::encoders::EncoderBuilder::Time32Second(inner) => {
+                convert_encoder_builder!(py, inner, value, Time32Second, Time32SecondEncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::Time64Microsecond(inner) => convert_encoder_builder!(
+                py,
+                inner,
+                value,
+                Time64Microsecond,
+                Time64MicrosecondEncoderBuilder
+            ),
+            pgpq::encoders::EncoderBuilder::DurationMicrosecond(inner) => convert_encoder_builder!(
+                py,
+                inner,
+                value,
+                DurationMicrosecond,
+                DurationMicrosecondEncoderBuilder
+            ),
+            pgpq::encoders::EncoderBuilder::DurationMillisecond(inner) => convert_encoder_builder!(
+                py,
+                inner,
+                value,
+                DurationMillisecond,
+                DurationMillisecondEncoderBuilder
+            ),
+            pgpq::encoders::EncoderBuilder::DurationSecond(inner) => convert_encoder_builder!(
+                py,
+                inner,
+                value,
+                DurationSecond,
+                DurationSecondEncoderBuilder
+            ),
+            pgpq::encoders::EncoderBuilder::String(inner) => convert_encoder_builder!(
+                py,
+                inner,
+                value,
+                String,
+                StringEncoderBuilder,
+                with_output
+            ),
+            pgpq::encoders::EncoderBuilder::LargeString(inner) => convert_encoder_builder!(
+                py,
+                inner,
+                value,
+                LargeString,
+                LargeStringEncoderBuilder,
+                with_output
+            ),
+            pgpq::encoders::EncoderBuilder::Binary(inner) => {
+                convert_encoder_builder!(py, inner, value, Binary, BinaryEncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::LargeBinary(inner) => {
+                convert_encoder_builder!(py, inner, value, LargeBinary, LargeBinaryEncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::List(inner) => {
+                convert_encoder_builder!(py, inner, value, List, ListEncoderBuilder)
+            }
+            pgpq::encoders::EncoderBuilder::LargeList(inner) => {
+                convert_encoder_builder!(py, inner, value, LargeList, LargeListEncoderBuilder)
+            }
         })
     }
 }
@@ -897,23 +993,15 @@ impl<'py> IntoPyObject<'py> for EncoderBuilder {
             EncoderBuilder::Float16(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::Float32(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::Float64(inner) => Ok(inner.into_pyobject(py)?.into_any()),
-            EncoderBuilder::TimestampMicrosecond(inner) => {
-                Ok(inner.into_pyobject(py)?.into_any())
-            }
-            EncoderBuilder::TimestampMillisecond(inner) => {
-                Ok(inner.into_pyobject(py)?.into_any())
-            }
+            EncoderBuilder::TimestampMicrosecond(inner) => Ok(inner.into_pyobject(py)?.into_any()),
+            EncoderBuilder::TimestampMillisecond(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::TimestampSecond(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::Date32(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::Time32Millisecond(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::Time32Second(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::Time64Microsecond(inner) => Ok(inner.into_pyobject(py)?.into_any()),
-            EncoderBuilder::DurationMicrosecond(inner) => {
-                Ok(inner.into_pyobject(py)?.into_any())
-            }
-            EncoderBuilder::DurationMillisecond(inner) => {
-                Ok(inner.into_pyobject(py)?.into_any())
-            }
+            EncoderBuilder::DurationMicrosecond(inner) => Ok(inner.into_pyobject(py)?.into_any()),
+            EncoderBuilder::DurationMillisecond(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::DurationSecond(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::String(inner) => Ok(inner.into_pyobject(py)?.into_any()),
             EncoderBuilder::LargeString(inner) => Ok(inner.into_pyobject(py)?.into_any()),
