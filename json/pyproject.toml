@@ -1,6 +1,7 @@
 
 [project]
 name = "arrow-json"
+dynamic = ["version"]
 description = "Arrow -> JSON encoder"
 authors = [
     {name = "Adrian Garcia Badaracco"}
