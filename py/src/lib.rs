@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use encoders::EncoderBuilder;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use pyo3::Python;
 
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
@@ -19,7 +18,6 @@ mod utils;
 struct ArrowToPostgresBinaryEncoder {
     encoder: pgpq::ArrowToPostgresBinaryEncoder,
     buf: BytesMut,
-    empty: Py<PyAny>,
 }
 
 const BUFF_SIZE: usize = 1024 * 1024;
@@ -27,57 +25,58 @@ const BUFF_SIZE: usize = 1024 * 1024;
 #[pymethods]
 impl ArrowToPostgresBinaryEncoder {
     #[new]
-    fn new(py: Python, pyschema: &PyAny) -> PyResult<Self> {
-        // TODO: error handling
+    fn new(_py: Python, pyschema: &Bound<'_, PyAny>) -> PyResult<Self> {
         let encoder = pgpq::ArrowToPostgresBinaryEncoder::try_new(
-            &ArrowSchema::from_pyarrow(pyschema).unwrap(),
+            &ArrowSchema::from_pyarrow_bound(pyschema).unwrap(),
         )
         .unwrap();
         Ok(Self {
             encoder,
             buf: BytesMut::with_capacity(BUFF_SIZE),
-            empty: PyBytes::new(py, &vec![][..]).into(),
         })
     }
     #[staticmethod]
-    fn infer_encoder(py: Python, py_field: &PyAny) -> PyResult<EncoderBuilder> {
+    fn infer_encoder(py: Python, py_field: &Bound<'_, PyAny>) -> PyResult<EncoderBuilder> {
         EncoderBuilder::try_new(py, py_field)
     }
     #[staticmethod]
-    fn new_with_encoders(py: Python, py_schema: &PyAny, py_encoders: &PyDict) -> PyResult<Self> {
-        // TODO: error handling
+    fn new_with_encoders(
+        _py: Python,
+        py_schema: &Bound<'_, PyAny>,
+        py_encoders: &Bound<'_, PyDict>,
+    ) -> PyResult<Self> {
         let mut encoders: HashMap<String, pgpq::encoders::EncoderBuilder> = HashMap::new();
-        for item in py_encoders.items() {
-            let (name, py_builder): (String, crate::encoders::EncoderBuilder) = item.extract()?;
+        for (key, value) in py_encoders.iter() {
+            let name: String = key.extract()?;
+            let py_builder: crate::encoders::EncoderBuilder = value.extract()?;
             let encoder: pgpq::encoders::EncoderBuilder = py_builder.into();
             encoders.insert(name, encoder);
         }
-        let schema = &ArrowSchema::from_pyarrow(py_schema).unwrap();
+        let schema = &ArrowSchema::from_pyarrow_bound(py_schema).unwrap();
         let encoder =
             pgpq::ArrowToPostgresBinaryEncoder::try_new_with_encoders(schema, &encoders).unwrap();
         Ok(Self {
             encoder,
             buf: BytesMut::with_capacity(BUFF_SIZE),
-            empty: PyBytes::new(py, &vec![][..]).into(),
         })
     }
-    fn write_header(&mut self, py: Python) -> Py<PyAny> {
+    fn write_header(&mut self, py: Python) -> PyObject {
         self.encoder.write_header(&mut self.buf);
-        PyBytes::new(py, &self.buf.split()[..]).into()
+        PyBytes::new(py, &self.buf.split()[..]).into_any().unbind()
     }
-    fn write_batch(&mut self, py_batch: &PyAny) -> Py<PyAny> {
-        let batch = &RecordBatch::from_pyarrow(py_batch).unwrap();
+    fn write_batch(&mut self, py: Python, py_batch: &Bound<'_, PyAny>) -> PyObject {
+        let batch = &RecordBatch::from_pyarrow_bound(py_batch).unwrap();
         self.encoder.write_batch(batch, &mut self.buf).unwrap();
 
         if self.buf.len() > BUFF_SIZE {
-            Python::with_gil(|py| PyBytes::new(py, &self.buf.split()[..]).into())
+            PyBytes::new(py, &self.buf.split()[..]).into_any().unbind()
         } else {
-            self.empty.clone()
+            PyBytes::new(py, &[][..]).into_any().unbind()
         }
     }
-    fn finish(&mut self) -> &[u8] {
+    fn finish(&mut self, py: Python) -> PyObject {
         self.encoder.write_footer(&mut self.buf).unwrap();
-        &self.buf[..]
+        PyBytes::new(py, &self.buf[..]).into_any().unbind()
     }
     fn schema(&self) -> crate::pg_schema::PostgresSchema {
         self.encoder.schema().into()
@@ -85,7 +84,7 @@ impl ArrowToPostgresBinaryEncoder {
 }
 
 #[pymodule]
-fn _pgpq(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _pgpq(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ArrowToPostgresBinaryEncoder>()?;
     m.add_class::<crate::encoders::Int8EncoderBuilder>()?;
     m.add_class::<crate::encoders::ListEncoderBuilder>()?;
