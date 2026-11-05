@@ -49,7 +49,7 @@ impl PostgresType {
             PostgresType::Time => TypeSize::Fixed(8),
             PostgresType::Timestamp => TypeSize::Fixed(8),
             PostgresType::TimestampTz(_) => TypeSize::Fixed(8),
-            PostgresType::Interval => TypeSize::Fixed(12),
+            PostgresType::Interval => TypeSize::Fixed(16),
             PostgresType::Numeric => TypeSize::Variable,
             PostgresType::List(_) => TypeSize::Variable,
             PostgresType::Null => TypeSize::Fixed(0),

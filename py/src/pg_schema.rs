@@ -136,10 +136,18 @@ pub struct Interval;
 impl_simple!(Interval, pgpq::pg_schema::PostgresType::Interval);
 
 #[pyclass(module = "pgpq._pgpq")]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct List {
     name: String,
     inner: Box<Column>,
+}
+
+// Two lists are the same Postgres type when their elements are. The name is the
+// Arrow child field's name, which Postgres never sees.
+impl PartialEq for List {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
 }
 
 #[pymethods]
