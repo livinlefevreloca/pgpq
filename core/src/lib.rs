@@ -1,9 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
 
 use arrow_array::RecordBatch;
-use arrow_schema::Fields;
-use arrow_schema::Schema;
+use arrow_schema::{Fields, Schema, SchemaRef};
 use bytes::{Buf, BufMut, BytesMut};
 use error::ErrorKind;
 
@@ -18,7 +17,26 @@ use crate::decoders::{create_decoders, PostgresDecoder};
 use crate::encoders::{BuildEncoder, Encode, EncoderBuilder};
 use crate::pg_schema::PostgresSchema;
 
-const HEADER_MAGIC_BYTES: &[u8] = b"PGCOPY\n\xff\r\n\0";
+/// The signature that opens every binary COPY stream.
+const HEADER_MAGIC_BYTES: &[u8; HEADER_MAGIC_LEN] = b"PGCOPY\n\xff\r\n\0";
+const HEADER_MAGIC_LEN: usize = 11;
+
+/// The flags field follows the signature, and the header extension length
+/// follows the flags. Both are 32-bit integers.
+const HEADER_EXTENSION_LEN_OFFSET: usize = HEADER_MAGIC_LEN + 4;
+const HEADER_FIXED_LEN: usize = HEADER_EXTENSION_LEN_OFFSET + 4;
+
+/// Each row starts with a 16-bit field count.
+const FIELD_COUNT_LEN: usize = std::mem::size_of::<i16>();
+
+/// Each field starts with a 32-bit length.
+const FIELD_LEN_LEN: usize = std::mem::size_of::<i32>();
+
+/// A field count of -1 marks the end of the stream.
+const TRAILER_FIELD_COUNT: i16 = -1;
+
+/// A field length of -1 marks a null value.
+const NULL_FIELD_LEN: i32 = -1;
 
 #[derive(Debug, PartialEq)]
 enum EncoderState {
@@ -104,7 +122,7 @@ impl ArrowToPostgresBinaryEncoder {
 
     pub fn write_header(&mut self, out: &mut BytesMut) {
         assert_eq!(self.state, EncoderState::Created);
-        out.put(HEADER_MAGIC_BYTES);
+        out.put_slice(HEADER_MAGIC_BYTES);
         out.put_i32(0); // flags
         out.put_i32(0); // header extension
         self.state = EncoderState::Encoding;
@@ -149,275 +167,223 @@ impl ArrowToPostgresBinaryEncoder {
 
     pub fn write_footer(&mut self, out: &mut BytesMut) -> Result<(), ErrorKind> {
         assert_eq!(self.state, EncoderState::Encoding);
-        out.put_i16(-1);
+        out.put_i16(TRAILER_FIELD_COUNT);
         self.state = EncoderState::Finished;
         Ok(())
     }
 }
 
-enum BatchDecodeResult {
-    Batch(RecordBatch),
-    Incomplete(usize),
-    Error(ErrorKind),
-    PartialConsume { batch: RecordBatch, consumed: usize },
+/// Rows per record batch when the caller does not choose a size.
+pub const DEFAULT_BATCH_SIZE: usize = 65_536;
+
+/// Header flag bit 16 means every row carries an OID field. Only servers before
+/// Postgres 12 write it, for tables created WITH OIDS.
+const HEADER_OIDS_FLAG: u32 = 1 << 16;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StreamState {
+    Header,
+    Rows,
+    Finished,
+    Failed,
 }
 
-pub struct PostgresBinaryToArrowDecoder<R> {
+/// The extent of the next row in a buffer.
+enum RowExtent {
+    /// The buffer ends before the row does.
+    Incomplete,
+    /// The next thing in the buffer is the trailer.
+    Trailer,
+    /// A complete row of this many bytes, field count included.
+    Complete(usize),
+}
+
+/// Decodes a binary COPY stream fed to it in pieces of any size.
+///
+/// A row is decoded only once all of its bytes have arrived. Every field in the
+/// format carries its length, so the decoder finds where a row ends before
+/// decoding it, and a column decoder never sees part of a row.
+pub struct PostgresBinaryToArrowDecoder {
     schema: PostgresSchema,
     decoders: Vec<PostgresDecoder>,
-    source: R,
-    state: EncoderState,
-    capacity: usize,
+    batch_size: usize,
+    rows_in_batch: usize,
+    pending: BytesMut,
+    state: StreamState,
 }
 
-impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
-    pub fn new(schema: PostgresSchema, source: R, capacity: usize) -> Result<Self, ErrorKind> {
+impl PostgresBinaryToArrowDecoder {
+    /// Creates a decoder that emits a batch every batch_size rows.
+    pub fn new(schema: PostgresSchema, batch_size: usize) -> Result<Self, ErrorKind> {
+        if batch_size == 0 {
+            return Err(ErrorKind::InvalidBatchSize);
+        }
         let decoders = create_decoders(&schema);
-        Ok(PostgresBinaryToArrowDecoder {
+        Ok(Self {
             schema,
             decoders,
-            source,
-            state: EncoderState::Created,
-            capacity,
+            batch_size,
+            rows_in_batch: 0,
+            pending: BytesMut::new(),
+            state: StreamState::Header,
         })
     }
 
-    /// Try to create a new decoder using an arrow schema. Will fail if the types in the schema
-    /// are not supported by the decoder.
-    pub fn try_new_with_arrow_schema(
-        schema: Schema,
-        source: R,
-        capacity: usize,
-    ) -> Result<Self, ErrorKind> {
-        let pg_schema = PostgresSchema::try_from(schema)?;
-        let decoders = create_decoders(&pg_schema);
-        Ok(PostgresBinaryToArrowDecoder {
-            decoders,
-            schema: pg_schema,
-            source,
-            state: EncoderState::Created,
-            capacity,
-        })
+    /// Creates a decoder from an Arrow schema. Fails if a field's type has no
+    /// Postgres decoder.
+    pub fn try_new_with_arrow_schema(schema: Schema, batch_size: usize) -> Result<Self, ErrorKind> {
+        Self::new(PostgresSchema::try_from(schema)?, batch_size)
     }
 
-    /// Reads the header from the source and validates it.
-    pub fn read_header(&mut self) -> Result<(), ErrorKind> {
-        assert_eq!(self.state, EncoderState::Created);
+    /// The Arrow schema of the batches this decoder produces.
+    pub fn arrow_schema(&self) -> SchemaRef {
+        self.schema.clone().into()
+    }
 
-        // Header is always 11 bytes long. b"PGCOPY\n\xff\r\n\0"
-        let mut header = [0; 11];
-        self.source.read_exact(&mut header)?;
-        if header != HEADER_MAGIC_BYTES {
-            return Err(ErrorKind::InvalidBinaryHeader { bytes: header });
+    /// Whether the header has been read.
+    pub fn header_read(&self) -> bool {
+        self.state != StreamState::Header
+    }
+
+    /// Whether the trailer has been read.
+    pub fn is_finished(&self) -> bool {
+        self.state == StreamState::Finished
+    }
+
+    /// Adds bytes from the stream and returns every batch they complete.
+    ///
+    /// The trailer flushes the last, partly filled batch. An error leaves the
+    /// decoder failed, and every later call returns DecoderFailed.
+    pub fn write(&mut self, data: &[u8]) -> Result<Vec<RecordBatch>, ErrorKind> {
+        match self.state {
+            // The stream already failed and its column decoders may hold part of a row.
+            StreamState::Failed => return Err(ErrorKind::DecoderFailed),
+
+            // Nothing may follow the trailer.
+            StreamState::Finished if !data.is_empty() => return Err(ErrorKind::DataAfterTrailer),
+
+            StreamState::Finished => return Ok(vec![]),
+            StreamState::Header | StreamState::Rows => {}
         }
 
-        // read flags and header extension both of which we ignore the values of.
-        let mut flags = [0; 4];
-        self.source.read_exact(&mut flags)?;
-
-        let mut header_extension = [0; 4];
-        self.source.read_exact(&mut header_extension)?;
-
-        self.state = EncoderState::Encoding;
-        Ok(())
+        self.pending.extend_from_slice(data);
+        let result = self.decode_pending();
+        if result.is_err() {
+            self.state = StreamState::Failed;
+        }
+        result
     }
 
-    /// read batches of bytes from the source and decode them into RecordBatches.
-    pub fn decode_batches(&mut self) -> Result<Vec<RecordBatch>, ErrorKind> {
-        let mut batches = Vec::new();
-        let mut buf = BytesMut::with_capacity(self.capacity);
-        let mut eof = false;
-        while self.state == EncoderState::Encoding {
-            // Read loop. Read from source until buf is full.
-            let mut data = self.source.fill_buf()?;
-            loop {
-                // If there is no data left in the source, break the loop and finish the batch.
-                // set the eof flag to true to indicate that the source has been fully read.
-                if data.is_empty() {
-                    eof = true;
-                    break;
-                // if data was read from the source, put it into the buffer and single
-                // to source that we have consumed the data by calling BufRead::consume.
+    /// Confirms the stream ended with its trailer.
+    ///
+    /// Call it once the source is exhausted. A stream cut off before the trailer
+    /// is an error, so a truncated COPY is never mistaken for a complete one.
+    pub fn finish(&mut self) -> Result<(), ErrorKind> {
+        match self.state {
+            StreamState::Finished => Ok(()),
+            StreamState::Failed => Err(ErrorKind::DecoderFailed),
+            StreamState::Header | StreamState::Rows => {
+                self.state = StreamState::Failed;
+                if self.pending.is_empty() {
+                    Err(ErrorKind::MissingTrailer)
                 } else {
-                    buf.put(data);
-                    let read = data.len();
-                    self.source.consume(read);
-                }
-                data = self.source.fill_buf()?;
-
-                // If the remaining capacity of the buffer is less than the length of the data,
-                // break the loop.
-                let remaining = buf.capacity() - buf.len();
-                if remaining < data.len() {
-                    break;
-                }
-            }
-
-            // If the eof flag is not set and there remains capacity in the buffer, read the
-            // ${remaining_capacity} bytes from the source and put them into the buffer.
-            let remaining = buf.capacity() - buf.len();
-            if !eof && remaining > 0 {
-                let read = std::cmp::min(data.len(), buf.remaining());
-                buf.put(&data[..read]);
-                self.source.consume(read);
-            }
-
-            // If we have reached the end of the source decode the batch and return error if
-            // there is any remaining data in the buffer indicated by and IncompleteDecode
-            // or PartialConsume BatchDecodeResult.
-            if eof {
-                if !buf.is_empty() {
-                    match self.decode_batch(&mut buf) {
-                        BatchDecodeResult::Batch(batch) => batches.push(batch),
-                        BatchDecodeResult::Error(e) => return Err(e),
-                        BatchDecodeResult::Incomplete(consumed)
-                        | BatchDecodeResult::PartialConsume { batch: _, consumed } => {
-                            return Err(ErrorKind::IncompleteDecode {
-                                remaining_bytes: buf[consumed..].to_vec(),
-                            })
-                        }
-                    }
-                }
-                self.state = EncoderState::Finished;
-            // If we have not reached the end of the source, decode the batch.
-            } else {
-                match self.decode_batch(&mut buf) {
-                    BatchDecodeResult::Batch(batch) => {
-                        batches.push(batch);
-                        buf.clear()
-                    }
-                    // If we receive a PartialConsume BatchDecodeResult, store the batches we did
-                    // manage to decode and continue reading from the source with the remaining
-                    // data from the previous read in the buffer.
-                    BatchDecodeResult::PartialConsume { batch, consumed } => {
-                        batches.push(batch);
-                        let old_buf = buf;
-                        buf = BytesMut::with_capacity(self.capacity);
-                        buf.put(&old_buf[consumed..]);
-                    }
-                    // If we receive an Incomplete BatchDecodeResult, increase the capacity of the
-                    // buffer reading more data from the source and try to decode the batch again.
-                    BatchDecodeResult::Incomplete(_) => {
-                        // increase the capacity attribute of the decoder by a factor of 2.
-                        buf.reserve(self.capacity);
-                        self.capacity *= 2;
-                    }
-                    BatchDecodeResult::Error(e) => return Err(e),
+                    Err(ErrorKind::IncompleteDecode {
+                        remaining_bytes: self.pending.to_vec(),
+                    })
                 }
             }
         }
+    }
+
+    fn decode_pending(&mut self) -> Result<Vec<RecordBatch>, ErrorKind> {
+        // The buffer is moved out so its rows can be decoded while the column
+        // decoders are borrowed mutably.
+        let pending = std::mem::take(&mut self.pending);
+        let mut batches = vec![];
+        let mut pos = 0;
+
+        if self.state == StreamState::Header {
+            match header_len(&pending)? {
+                None => {
+                    self.pending = pending;
+                    return Ok(batches);
+                }
+                Some(len) => {
+                    pos = len;
+                    self.state = StreamState::Rows;
+                }
+            }
+        }
+
+        while self.state == StreamState::Rows {
+            match row_extent(&pending[pos..], self.decoders.len())? {
+                RowExtent::Incomplete => break,
+                RowExtent::Trailer => {
+                    pos += FIELD_COUNT_LEN;
+
+                    // Postgres ends the stream at the trailer.
+                    if pos != pending.len() {
+                        return Err(ErrorKind::DataAfterTrailer);
+                    }
+
+                    if self.rows_in_batch > 0 {
+                        batches.push(self.finish_batch()?);
+                    }
+                    self.state = StreamState::Finished;
+                }
+                RowExtent::Complete(len) => {
+                    // The field count was checked by row_extent.
+                    self.decode_row(&pending[pos + FIELD_COUNT_LEN..pos + len])?;
+                    pos += len;
+                    self.rows_in_batch += 1;
+                    if self.rows_in_batch == self.batch_size {
+                        batches.push(self.finish_batch()?);
+                    }
+                }
+            }
+        }
+
+        self.pending = pending;
+        self.pending.advance(pos);
         Ok(batches)
     }
 
-    /// Decode a single batch of bytes from the buffer. This method is called by decode_batches
-    /// and has several different completion states each represented by a BatchDecodeResult.
-    fn decode_batch(&mut self, buf: &mut BytesMut) -> BatchDecodeResult {
-        // ensure that the decoder is in the correct state before proceeding.
-        assert_eq!(self.state, EncoderState::Encoding);
-
-        // create a new BufferView from the buffer.
-        let mut local_buf = BufferView::new(buf);
-        // Keep track of the number of rows in the batch.
-        let mut rows = 0;
-
-        // Each iteration of the loop reads a tuple from the data.
-        // If we are not able to read a tuple, return a BatchDecodeResult::Incomplete.
-        // If we were able to read some tuples, but not all the data in the buffer was consumed,
-        // return a BatchDecodeResult::PartialConsume.
-        while local_buf.remaining() > 0 {
-            // Store the number of bytes consumed before reading the tuple.
-            let consumed = local_buf.consumed();
-
-            // Read the number of columns in the tuple. This number is
-            // stored as a 16-bit integer. This value is the same for all
-            // tuples in the batch.
-            let tuple_len: u16 = match local_buf.consume_into_u16() {
-                Ok(len) => len,
-                Err(e) => {
-                    return BatchDecodeResult::Error(e);
-                }
-            };
-
-            // If the tuple length is 0xffff we have reached the end of the
-            // snapshot and we can break the loop and finish the batch.
-            if tuple_len == 0xffff {
-                break;
-            }
-
-            // Each iteration of the loop reads a column from the tuple using the
-            // decoder specfied via the schema.
-            for decoder in self.decoders.iter_mut() {
-                // If local_buf has been fully consumed and we have not read any rows,
-                // return a BatchDecodeResult::Incomplete.
-                if local_buf.remaining() == 0 && rows == 0 {
-                    return BatchDecodeResult::Incomplete(local_buf.consumed());
-                // If local_buf has been fully consumed and we have read some rows,
-                // return a BatchDecodeResult::PartialConsume, passing the number of bytes
-                // consumed before reading the tuple to the caller so it can know how much data
-                // was consumed.
-                } else if local_buf.remaining() == 0 {
-                    return match self.finish_batch() {
-                        Ok(batch) => BatchDecodeResult::PartialConsume { batch, consumed },
-                        Err(e) => BatchDecodeResult::Error(e),
-                    };
-                }
-                // Apply the decoder to the local_buf. Cosume the data from the buffer as needed
-                match decoder.decode(&mut local_buf) {
-                    // If the decoder was able to decode the data, continue to the next column.
-                    Ok(_) => {}
-                    // If we receive a IncompleteData error, we have reached the end of the data in
-                    // the buffer. If we have decoded some tuples, return a BatchDecodeResult::PartialConsume,
-                    // otherwise return a BatchDecodeResult::Incomplete.
-                    Err(ErrorKind::IncompleteData) => {
-                        // If we have not read any rows, return a BatchDecodeResult::Incomplete.
-                        if rows == 0 {
-                            return BatchDecodeResult::Incomplete(local_buf.consumed());
-                        } else {
-                            // If we have read some rows, return a BatchDecodeResult::PartialConsume,
-                            return match self.finish_batch() {
-                                Ok(batch) => BatchDecodeResult::PartialConsume { batch, consumed },
-                                Err(e) => BatchDecodeResult::Error(e),
-                            };
-                        }
-                    }
-                    Err(e) => return BatchDecodeResult::Error(e),
-                }
-            }
-            // Increment the number of rows in the batch.
-            rows += 1;
+    /// Decodes one complete row, given its fields without the field count.
+    fn decode_row(&mut self, fields: &[u8]) -> Result<(), ErrorKind> {
+        let mut view = BufferView::new(fields);
+        for decoder in self.decoders.iter_mut() {
+            decoder.decode(&mut view).map_err(|e| match e {
+                // The row is complete, so a decoder that runs short read a field
+                // whose length does not fit the column's type.
+                ErrorKind::IncompleteData => ErrorKind::MalformedRow {
+                    reason: format!(
+                        "the field for column {} does not match its type",
+                        decoder.name()
+                    ),
+                },
+                other => other,
+            })?;
         }
 
-        match self.finish_batch() {
-            Ok(batch) => BatchDecodeResult::Batch(batch),
-            Err(e) => BatchDecodeResult::Error(e),
+        // Each decoder reads its field's length prefix, so a decoder that read
+        // more or less than its field leaves the row misaligned.
+        if view.remaining() != 0 {
+            return Err(ErrorKind::MalformedRow {
+                reason: format!(
+                    "{} bytes were left over after decoding every column",
+                    view.remaining()
+                ),
+            });
         }
+        Ok(())
     }
 
     fn finish_batch(&mut self) -> Result<RecordBatch, ErrorKind> {
-        // Find the mininum length column in the decoders. These can be different if
-        // we are in a partial consume state. We will truncate the columns to the length
-        // of the shortest column and pick up the lost data in the next batch.
-        //
-        // For example: If on the current batch we were able to decode 3 rows in total
-        // but decoded the first and second column for a 4th rows we will truncate the
-        // third column to 3 rows.
-        //
-        //    column 1 | column 2 | column 3           column 1 | column 2 | column 3
-        //    ---------|----------|---------           ---------|----------|---------
-        //    1        | 2        | 3                  1        | 2        | 3
-        //    2        | 3        | 4          ->      2        | 3        | 4
-        //    3        | 4        | 5                  3        | 4        | 5
-        //    4        |          |
-        //
-        //
-        //  the truncated value will be not be lost because it will still be in the buffer
-        //  view on the next run. This is orchrstrated by the decode_batch method which
-        //  passes the number of bytes actually consumed to the caller.
-        let column_len = self.decoders.iter().map(|d| d.column_len()).min().unwrap();
+        let column_len = self.rows_in_batch;
+        self.rows_in_batch = 0;
 
-        // Determine which columns in the batch are fully null so that we can alter the schema
-        // to reflect this. Pyarrow stores all null columns in a more space efficient way.
-        // But the schema must be updated to indicate that the column is all nulls
+        // An all-null column becomes a NullArray, so its field's type in this
+        // batch's schema must be Null as well.
         let null_columns = self
             .decoders
             .iter()
@@ -425,8 +391,6 @@ impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
             .map(|decoder| decoder.name())
             .collect::<Vec<String>>();
 
-        // For each decoder call its finish method to coerce the data into an Arrow array.
-        // and append the array to the columns vector.
         let columns = self
             .decoders
             .iter_mut()
@@ -437,6 +401,196 @@ impl<R: BufRead> PostgresBinaryToArrowDecoder<R> {
             self.schema.clone().nullify_columns(&null_columns).into(),
             columns,
         )?)
+    }
+}
+
+/// Returns the header's length once all of it is in buf, or None if more bytes
+/// are needed.
+fn header_len(buf: &[u8]) -> Result<Option<usize>, ErrorKind> {
+    if buf.len() < HEADER_MAGIC_LEN {
+        return Ok(None);
+    }
+
+    if &buf[..HEADER_MAGIC_LEN] != HEADER_MAGIC_BYTES {
+        let bytes: [u8; HEADER_MAGIC_LEN] = buf[..HEADER_MAGIC_LEN].try_into().unwrap();
+        return Err(ErrorKind::InvalidBinaryHeader { bytes });
+    }
+
+    if buf.len() < HEADER_FIXED_LEN {
+        return Ok(None);
+    }
+
+    let flags = u32::from_be_bytes(
+        buf[HEADER_MAGIC_LEN..HEADER_EXTENSION_LEN_OFFSET]
+            .try_into()
+            .unwrap(),
+    );
+    if flags & HEADER_OIDS_FLAG != 0 {
+        return Err(ErrorKind::UnsupportedHeaderFlags { flags });
+    }
+
+    // The extension area is reserved for future use, and decoders skip it.
+    let extension_len = u32::from_be_bytes(
+        buf[HEADER_EXTENSION_LEN_OFFSET..HEADER_FIXED_LEN]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let header_len = HEADER_FIXED_LEN + extension_len;
+    if buf.len() < header_len {
+        return Ok(None);
+    }
+    Ok(Some(header_len))
+}
+
+/// Finds where the row at the start of buf ends, reading only length prefixes.
+fn row_extent(buf: &[u8], expected_fields: usize) -> Result<RowExtent, ErrorKind> {
+    if buf.len() < FIELD_COUNT_LEN {
+        return Ok(RowExtent::Incomplete);
+    }
+
+    let field_count = i16::from_be_bytes([buf[0], buf[1]]);
+    if field_count == TRAILER_FIELD_COUNT {
+        return Ok(RowExtent::Trailer);
+    }
+
+    if field_count < 0 || field_count as usize != expected_fields {
+        return Err(ErrorKind::UnexpectedFieldCount {
+            expected: expected_fields,
+            actual: field_count,
+        });
+    }
+
+    let mut pos = FIELD_COUNT_LEN;
+    for _ in 0..field_count {
+        if buf.len() < pos + FIELD_LEN_LEN {
+            return Ok(RowExtent::Incomplete);
+        }
+        let field_len = i32::from_be_bytes(buf[pos..pos + FIELD_LEN_LEN].try_into().unwrap());
+        pos += FIELD_LEN_LEN;
+
+        if field_len == NULL_FIELD_LEN {
+            continue;
+        }
+
+        if field_len < 0 {
+            return Err(ErrorKind::MalformedRow {
+                reason: format!("negative field length {field_len}"),
+            });
+        }
+
+        pos += field_len as usize;
+        if buf.len() < pos {
+            return Ok(RowExtent::Incomplete);
+        }
+    }
+    Ok(RowExtent::Complete(pos))
+}
+
+/// Decodes a binary COPY stream read from source, one batch at a time.
+///
+/// Iterating yields each batch as soon as it fills, so memory holds about one
+/// batch at a time. decode_batches reads the whole stream at once.
+pub struct PostgresBinaryToArrowReader<R> {
+    source: R,
+    inner: PostgresBinaryToArrowDecoder,
+    ready: VecDeque<RecordBatch>,
+    done: bool,
+}
+
+impl<R: BufRead> PostgresBinaryToArrowReader<R> {
+    /// Creates a decoder that emits a batch every batch_size rows.
+    pub fn new(schema: PostgresSchema, source: R, batch_size: usize) -> Result<Self, ErrorKind> {
+        Ok(Self::from_decoder(
+            PostgresBinaryToArrowDecoder::new(schema, batch_size)?,
+            source,
+        ))
+    }
+
+    /// Creates a decoder from an Arrow schema. Fails if a field's type has no
+    /// Postgres decoder.
+    pub fn try_new_with_arrow_schema(
+        schema: Schema,
+        source: R,
+        batch_size: usize,
+    ) -> Result<Self, ErrorKind> {
+        Ok(Self::from_decoder(
+            PostgresBinaryToArrowDecoder::try_new_with_arrow_schema(schema, batch_size)?,
+            source,
+        ))
+    }
+
+    fn from_decoder(inner: PostgresBinaryToArrowDecoder, source: R) -> Self {
+        Self {
+            source,
+            inner,
+            ready: VecDeque::new(),
+            done: false,
+        }
+    }
+
+    /// The Arrow schema of the batches this decoder produces.
+    pub fn arrow_schema(&self) -> SchemaRef {
+        self.inner.arrow_schema()
+    }
+
+    /// Reads and validates the header.
+    ///
+    /// Iterating reads the header itself, so calling this first is optional. It
+    /// reports a bad header before any rows are requested.
+    pub fn read_header(&mut self) -> Result<(), ErrorKind> {
+        while !self.inner.header_read() {
+            if !self.read_more()? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the rest of the stream and returns every batch in it.
+    pub fn decode_batches(&mut self) -> Result<Vec<RecordBatch>, ErrorKind> {
+        self.collect()
+    }
+
+    /// Feeds the next piece of the source to the decoder. Returns false
+    /// once the source is exhausted.
+    fn read_more(&mut self) -> Result<bool, ErrorKind> {
+        let data = self.source.fill_buf()?;
+        if data.is_empty() {
+            self.done = true;
+            self.inner.finish()?;
+            return Ok(false);
+        }
+
+        let read = data.len();
+        let batches = self.inner.write(data)?;
+        self.source.consume(read);
+        self.ready.extend(batches);
+        Ok(true)
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ErrorKind> {
+        loop {
+            if let Some(batch) = self.ready.pop_front() {
+                return Ok(Some(batch));
+            }
+
+            if self.done {
+                return Ok(None);
+            }
+
+            if let Err(e) = self.read_more() {
+                self.done = true;
+                return Err(e);
+            }
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for PostgresBinaryToArrowReader<R> {
+    type Item = Result<RecordBatch, ErrorKind>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch().transpose()
     }
 }
 

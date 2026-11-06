@@ -7,7 +7,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pgpq::{pg_schema::PostgresSchema, PostgresBinaryToArrowDecoder};
+use pgpq::{pg_schema::PostgresSchema, PostgresBinaryToArrowReader};
 
 const READ_CHUNK_SIZE: usize = 1024 * 1024 * 8;
 
@@ -36,7 +36,7 @@ fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
     let schema = read_schema_file(schema_path, timezone);
     println!("Schema: {:?}", schema);
 
-    let mut decoder = PostgresBinaryToArrowDecoder::new(schema, reader, READ_CHUNK_SIZE).unwrap();
+    let mut decoder = PostgresBinaryToArrowReader::new(schema, reader, READ_CHUNK_SIZE).unwrap();
     decoder.read_header()?;
     let batches = decoder.decode_batches()?;
 

@@ -1,4 +1,5 @@
-from typing import Mapping, Union
+import os
+from typing import Iterator, Mapping, Union
 
 import pyarrow
 
@@ -23,7 +24,13 @@ class Char:
 class Text:
     def ddl(self) -> str | None: ...
 
+class Json:
+    def ddl(self) -> str | None: ...
+
 class Jsonb:
+    def ddl(self) -> str | None: ...
+
+class Numeric:
     def ddl(self) -> str | None: ...
 
 class Float4:
@@ -39,6 +46,12 @@ class Time:
     def ddl(self) -> str | None: ...
 
 class Timestamp:
+    def ddl(self) -> str | None: ...
+
+class TimestampTz:
+    def __init__(self, timezone: str = "UTC") -> None: ...
+    @property
+    def timezone(self) -> str: ...
     def ddl(self) -> str | None: ...
 
 class Interval:
@@ -70,13 +83,41 @@ PostgresType = Union[
     Float8,
     Char,
     Text,
+    Json,
     Jsonb,
+    Numeric,
     Date,
     Time,
     Timestamp,
+    TimestampTz,
     Interval,
     List,
 ]
+
+DEFAULT_BATCH_SIZE: int
+
+class DecodeError(ValueError): ...
+
+class PostgresBinaryToArrowReader:
+    def __init__(self, schema: PostgresSchema, batch_size: int = ...) -> None: ...
+    def write(
+        self, data: bytes | bytearray | memoryview
+    ) -> list[pyarrow.RecordBatch]: ...
+    def finish(self) -> None: ...
+    @property
+    def arrow_schema(self) -> pyarrow.Schema: ...
+
+class PostgresBinaryFileDecoder:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        schema: PostgresSchema,
+        batch_size: int = ...,
+    ) -> None: ...
+    def __iter__(self) -> Iterator[pyarrow.RecordBatch]: ...
+    def __next__(self) -> pyarrow.RecordBatch: ...
+    @property
+    def arrow_schema(self) -> pyarrow.Schema: ...
 
 class ArrowToPostgresBinaryEncoder:
     def __init__(self, __schema: pyarrow.Schema) -> None: ...

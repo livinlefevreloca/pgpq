@@ -130,6 +130,60 @@ impl_simple!(Time, pgpq::pg_schema::PostgresType::Time);
 pub struct Timestamp;
 impl_simple!(Timestamp, pgpq::pg_schema::PostgresType::Timestamp);
 
+/// timestamp with time zone. Decoded values carry timezone in their Arrow type.
+#[pyclass(module = "pgpq._pgpq")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimestampTz {
+    #[pyo3(get)]
+    timezone: String,
+}
+
+#[pymethods]
+impl TimestampTz {
+    #[new]
+    #[pyo3(signature = (timezone = "UTC".to_string()))]
+    fn new(timezone: String) -> Self {
+        Self { timezone }
+    }
+    fn __repr__(&self, py: Python) -> String {
+        self.py_repr(py)
+    }
+    fn __str__(&self, py: Python) -> String {
+        self.__repr__(py)
+    }
+    fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> PyResult<PyObject> {
+        let res = match op {
+            CompareOp::Eq => (self == other)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind(),
+            CompareOp::Ne => (self != other)
+                .into_pyobject(py)?
+                .to_owned()
+                .into_any()
+                .unbind(),
+            _ => PyNotImplemented::get(py).to_owned().into_any().unbind(),
+        };
+        Ok(res)
+    }
+    fn ddl(&self) -> Option<String> {
+        Some("TIMESTAMPTZ".to_string())
+    }
+}
+
+impl From<TimestampTz> for pgpq::pg_schema::PostgresType {
+    fn from(val: TimestampTz) -> Self {
+        pgpq::pg_schema::PostgresType::TimestampTz(val.timezone)
+    }
+}
+
+impl PythonRepr for TimestampTz {
+    fn py_repr(&self, _py: Python) -> String {
+        format!("TimestampTz({:?})", self.timezone)
+    }
+}
+
 #[pyclass(module = "pgpq._pgpq")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Interval;
@@ -217,6 +271,7 @@ pub enum PostgresType {
     Date(Date),
     Time(Time),
     Timestamp(Timestamp),
+    TimestampTz(TimestampTz),
     Interval(Interval),
     List(List),
 }
@@ -239,6 +294,7 @@ impl From<PostgresType> for pgpq::pg_schema::PostgresType {
             PostgresType::Date(inner) => inner.into(),
             PostgresType::Time(inner) => inner.into(),
             PostgresType::Timestamp(inner) => inner.into(),
+            PostgresType::TimestampTz(inner) => inner.into(),
             PostgresType::Interval(inner) => inner.into(),
             PostgresType::List(inner) => inner.into(),
         }
@@ -263,6 +319,9 @@ impl From<pgpq::pg_schema::PostgresType> for PostgresType {
             pgpq::pg_schema::PostgresType::Date => PostgresType::Date(Date),
             pgpq::pg_schema::PostgresType::Time => PostgresType::Time(Time),
             pgpq::pg_schema::PostgresType::Timestamp => PostgresType::Timestamp(Timestamp),
+            pgpq::pg_schema::PostgresType::TimestampTz(timezone) => {
+                PostgresType::TimestampTz(TimestampTz { timezone })
+            }
             pgpq::pg_schema::PostgresType::Interval => PostgresType::Interval(Interval),
             pgpq::pg_schema::PostgresType::List((name, inner)) => {
                 PostgresType::List(List::new((*inner).into(), name))
@@ -290,6 +349,7 @@ impl PythonRepr for PostgresType {
             PostgresType::Date(inner) => inner.py_repr(py),
             PostgresType::Time(inner) => inner.py_repr(py),
             PostgresType::Timestamp(inner) => inner.py_repr(py),
+            PostgresType::TimestampTz(inner) => inner.py_repr(py),
             PostgresType::Interval(inner) => inner.py_repr(py),
             PostgresType::List(inner) => inner.py_repr(py),
         }
@@ -331,6 +391,9 @@ impl Column {
             PostgresType::Date(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
             PostgresType::Time(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
             PostgresType::Timestamp(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::TimestampTz(inner) => {
+                inner.clone().into_pyobject(py)?.into_any().unbind()
+            }
             PostgresType::Interval(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
             PostgresType::List(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
         };

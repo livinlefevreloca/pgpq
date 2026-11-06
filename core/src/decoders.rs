@@ -4,13 +4,13 @@ use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow::compute::concat;
 use arrow_array::builder::GenericByteBuilder;
 use arrow_array::types::GenericBinaryType;
-use arrow_array::{self, Array, ArrayRef};
+use arrow_array::{self, new_null_array, Array, ArrayRef};
 use arrow_array::{
     BooleanArray, Date32Array, DurationMicrosecondArray, Float32Array, Float64Array,
     GenericListArray, GenericStringArray, Int16Array, Int32Array, Int64Array, NullArray,
     Time64MicrosecondArray, TimestampMicrosecondArray,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, FieldRef};
 use std::sync::Arc;
 
 use crate::buffer_view::BufferView;
@@ -22,7 +22,6 @@ use crate::pg_schema::{Column, PostgresSchema, PostgresType};
 pub(crate) trait Decoder {
     fn decode(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind>;
     fn finish(&mut self, column_len: usize) -> ArrayRef;
-    fn column_len(&self) -> usize;
     fn name(&self) -> String;
     fn is_null(&self) -> bool;
 }
@@ -50,20 +49,17 @@ macro_rules! impl_decode {
                 Ok(())
             }
 
-            fn column_len(&self) -> usize {
-                self.arr.len()
-            }
-
             fn name(&self) -> String {
                 self.name.to_string()
             }
 
             fn finish(&mut self, column_len: usize) -> ArrayRef {
                 self.arr.resize(column_len, None);
-                if self.is_null() {
-                    return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
-                }
+                // Taking the values resets the decoder for the next batch, null or not.
                 let data = std::mem::take(&mut self.arr);
+                if data.iter().all(|v| v.is_none()) {
+                    return Arc::new(NullArray::new(data.len())) as ArrayRef;
+                }
                 let array = Arc::new($array_kind::from(data));
                 array as ArrayRef
             }
@@ -113,20 +109,17 @@ macro_rules! impl_decode_fallible {
                 Ok(())
             }
 
-            fn column_len(&self) -> usize {
-                self.arr.len()
-            }
-
             fn name(&self) -> String {
                 self.name.to_string()
             }
 
             fn finish(&mut self, column_len: usize) -> ArrayRef {
                 self.arr.resize(column_len, None);
-                if self.is_null() {
-                    return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
-                }
+                // Taking the values resets the decoder for the next batch, null or not.
                 let data = std::mem::take(&mut self.arr);
+                if data.iter().all(|v| v.is_none()) {
+                    return Arc::new(NullArray::new(data.len())) as ArrayRef;
+                }
                 let array = Arc::new($array_kind::from(data));
                 array as ArrayRef
             }
@@ -148,18 +141,20 @@ macro_rules! impl_decode_variable_size {
                     return Ok(());
                 }
 
-                if field_size > buf.remaining() as u32 {
+                let field_size = field_size as usize;
+                if field_size > buf.remaining() {
                     return Err(ErrorKind::IncompleteData);
                 }
 
-                // Consume and any extra data that is not part of the field
-                // This is needed for example on jsonb fields where the first
-                // byte is the version number. This is more efficient than
-                // using remove in the transform function or creating a new
-                // vec from a slice of the data passed into it.
+                // Skip bytes at the start of the field that are not part of the
+                // value, such as jsonb's version byte. The field length counts
+                // them, so the value is that many bytes shorter.
+                let value_size = field_size
+                    .checked_sub($extra_bytes)
+                    .ok_or(ErrorKind::IncompleteData)?;
                 buf.swallow($extra_bytes);
 
-                let data = buf.consume_into_vec_n(field_size as usize)?;
+                let data = buf.consume_into_vec_n(value_size)?;
                 match $transform(data.try_into().unwrap()) {
                     Ok(v) => self.arr.push(Some(v)),
                     Err(e) => {
@@ -179,20 +174,17 @@ macro_rules! impl_decode_variable_size {
                 Ok(())
             }
 
-            fn column_len(&self) -> usize {
-                self.arr.len()
-            }
-
             fn name(&self) -> String {
                 self.name.to_string()
             }
 
             fn finish(&mut self, column_len: usize) -> ArrayRef {
                 self.arr.resize(column_len, None);
-                if self.is_null() {
-                    return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
-                }
+                // Taking the values resets the decoder for the next batch, null or not.
                 let data = std::mem::take(&mut self.arr);
+                if data.iter().all(|v| v.is_none()) {
+                    return Arc::new(NullArray::new(data.len())) as ArrayRef;
+                }
                 let array = Arc::new($array_kind::<$offset_size>::from(data));
                 array as ArrayRef
             }
@@ -310,20 +302,17 @@ impl Decoder for TimestampTzMicrosecondDecoder {
         Ok(())
     }
 
-    fn column_len(&self) -> usize {
-        self.arr.len()
-    }
-
     fn name(&self) -> String {
         self.name.to_string()
     }
 
     fn finish(&mut self, column_len: usize) -> ArrayRef {
         self.arr.resize(column_len, None);
-        if self.is_null() {
-            return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
-        }
+        // Taking the values resets the decoder for the next batch, null or not.
         let data = std::mem::take(&mut self.arr);
+        if data.iter().all(|v| v.is_none()) {
+            return Arc::new(NullArray::new(data.len())) as ArrayRef;
+        }
         let array = Arc::new(
             TimestampMicrosecondArray::from(data).with_timezone(self.timezone.to_string()),
         );
@@ -465,21 +454,17 @@ impl Decoder for BinaryDecoder {
         Ok(())
     }
 
-    fn column_len(&self) -> usize {
-        self.arr.len()
-    }
-
     fn name(&self) -> String {
         self.name.to_string()
     }
 
     fn finish(&mut self, column_len: usize) -> ArrayRef {
         self.arr.resize(column_len, None);
-        if self.is_null() {
-            return Arc::new(NullArray::new(self.arr.len())) as ArrayRef;
-        }
-
+        // Taking the values resets the decoder for the next batch, null or not.
         let data = std::mem::take(&mut self.arr);
+        if data.iter().all(|v| v.is_none()) {
+            return Arc::new(NullArray::new(data.len())) as ArrayRef;
+        }
         let mut builder: GenericByteBuilder<GenericBinaryType<i32>> = GenericByteBuilder::new();
         for v in data {
             match v {
@@ -513,7 +498,7 @@ impl_decode_variable_size!(
     // https://www.postgresql.org/docs/16/datatype-json.html
     1,
     GenericStringArray,
-    i64
+    i32
 );
 
 // const used for stringifying postgres decimals
@@ -660,10 +645,17 @@ impl_decode_variable_size!(
     i32
 );
 
+/// Decodes a Postgres array column into an Arrow List.
+///
+/// Elements are decoded by the inner decoder one row at a time. The child field
+/// comes from the schema, so a row that is null, empty or holds only null
+/// elements does not change the List's type. A multidimensional array is
+/// flattened into one list.
 #[derive(Debug)]
 pub struct ArrayDecoder {
     name: String,
-    arr: Vec<ArrayRef>,
+    element_field: FieldRef,
+    arr: Vec<Option<ArrayRef>>,
     inner: Box<PostgresDecoder>,
 }
 
@@ -671,7 +663,7 @@ impl Decoder for ArrayDecoder {
     fn decode(&mut self, buf: &mut BufferView<'_>) -> Result<(), ErrorKind> {
         let field_size = buf.consume_into_u32()?;
         if field_size == u32::MAX {
-            self.arr.push(Arc::new(NullArray::new(0)));
+            self.arr.push(None);
             return Ok(());
         }
 
@@ -687,77 +679,72 @@ impl Decoder for ArrayDecoder {
             buf.consume_into_u32()?;
         }
 
-        let nitems = dims.iter().product::<u32>() as usize;
+        // An empty array has no dimensions, and so no elements.
+        let nitems = if dims.is_empty() {
+            0
+        } else {
+            dims.iter().product::<u32>() as usize
+        };
 
         for _ in 0..nitems {
             self.inner.decode(buf)?;
         }
-        let array = self.inner.finish(nitems);
-        self.arr.push(array);
+        self.arr.push(Some(self.inner.finish(nitems)));
 
         Ok(())
     }
 
     fn finish(&mut self, _column_len: usize) -> ArrayRef {
-        // Check if all the arrays are null and return a null array if so
-        if self.is_null() {
-            return Arc::new(NullArray::new(0)) as ArrayRef;
+        let rows = std::mem::take(&mut self.arr);
+        if rows.iter().all(Option::is_none) {
+            return Arc::new(NullArray::new(rows.len())) as ArrayRef;
         }
 
-        let arrays = std::mem::take(&mut self.arr);
-
-        // Build the offset buffer for the commbined ListArray using
-        // the lengths of the component arrays
-        let mut offset_values = vec![0_i32];
-        for i in 1..arrays.len() + 1 {
-            offset_values.push(arrays[i - 1].len() as i32 + offset_values[i - 1]);
+        let element_type = self.element_field.data_type();
+        let mut offsets = vec![0i32];
+        let mut validity = Vec::with_capacity(rows.len());
+        let mut elements: Vec<ArrayRef> = vec![];
+        for row in rows {
+            let end = *offsets.last().unwrap();
+            match row {
+                None => {
+                    offsets.push(end);
+                    validity.push(false);
+                }
+                Some(array) => {
+                    // The inner decoder returns a NullArray when every element is
+                    // null, which must become a null array of the element type.
+                    let array = if array.data_type() == &DataType::Null {
+                        new_null_array(element_type, array.len())
+                    } else {
+                        array
+                    };
+                    offsets.push(end + array.len() as i32);
+                    validity.push(true);
+                    elements.push(array);
+                }
+            }
         }
-        let offsets = OffsetBuffer::new(offset_values.into());
 
-        // Concatenate the data of the component arrays
-        // to create the child data of the ListArray
-        let array_refs: Vec<&dyn Array> = arrays
-            .iter()
-            .filter(|a| !matches!(a.data_type(), DataType::Null))
-            .map(|a| a.as_ref())
-            .collect();
-        let child_data = concat(&array_refs).unwrap();
+        let element_refs: Vec<&dyn Array> = elements.iter().map(|a| a.as_ref()).collect();
+        let values = concat(&element_refs).unwrap();
 
-        // Calculate the null buffer for the ListArray
-        // by checking if the component arrays are null
-        let null_values = arrays
-            .iter()
-            .map(|a| !matches!(a.data_type(), DataType::Null))
-            .collect::<Vec<bool>>();
-
-        // If there are no nulls, return None for the null buffer
-        let nulls = if null_values.iter().all(|v| *v) {
+        let nulls = if validity.iter().all(|valid| *valid) {
             None
         } else {
-            Some(NullBuffer::from(BooleanBuffer::from(null_values)))
+            Some(NullBuffer::from(BooleanBuffer::from(validity)))
         };
 
-        // Construct the ListArray from parts
         Arc::new(GenericListArray::new(
-            Arc::new(Field::new(
-                self.name().replace("list_", ""),
-                arrays[0].data_type().clone(),
-                true,
-            )),
-            offsets,
-            child_data,
+            self.element_field.clone(),
+            OffsetBuffer::new(offsets.into()),
+            values,
             nulls,
         )) as ArrayRef
     }
 
     fn is_null(&self) -> bool {
-        self.arr
-            .iter()
-            .all(|a| matches!(a.data_type(), DataType::Null))
-    }
-
-    fn column_len(&self) -> usize {
-        self.arr.len()
+        self.arr.iter().all(Option::is_none)
     }
 
     fn name(&self) -> String {
@@ -857,17 +844,24 @@ impl PostgresDecoder {
                     arr: vec![],
                 })
             }
+            PostgresType::Jsonb => PostgresDecoder::Jsonb(JsonbDecoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
             PostgresType::Bytea => PostgresDecoder::Binary(BinaryDecoder {
                 name: name.to_string(),
                 arr: vec![],
             }),
-            PostgresType::List(ref inner) => {
-                let (name, column) = inner;
-                let inner_decoder = Box::new(PostgresDecoder::new(name, column));
+            PostgresType::List((ref element_name, ref element_column)) => {
+                let element_field = match DataType::from(column.data_type.clone()) {
+                    DataType::List(field) => field,
+                    other => unreachable!("a Postgres array maps to an Arrow List, not {other}"),
+                };
                 PostgresDecoder::List(ArrayDecoder {
                     name: name.to_string(),
+                    element_field,
                     arr: vec![],
-                    inner: inner_decoder,
+                    inner: Box::new(PostgresDecoder::new(element_name, element_column)),
                 })
             }
             _ => unimplemented!(),
@@ -914,27 +908,6 @@ impl PostgresDecoder {
             PostgresDecoder::Binary(ref decoder) => decoder.name(),
             PostgresDecoder::Jsonb(ref decoder) => decoder.name(),
             PostgresDecoder::List(ref decoder) => decoder.name(),
-        }
-    }
-
-    pub(crate) fn column_len(&self) -> usize {
-        match *self {
-            PostgresDecoder::Boolean(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Int16(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Int32(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Int64(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Float32(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Float64(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Numeric(ref decoder) => decoder.column_len(),
-            PostgresDecoder::TimestampMicrosecond(ref decoder) => decoder.column_len(),
-            PostgresDecoder::TimestampTzMicrosecond(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Date32(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Time64Microsecond(ref decoder) => decoder.column_len(),
-            PostgresDecoder::DurationMicrosecond(ref decoder) => decoder.column_len(),
-            PostgresDecoder::String(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Binary(ref decoder) => decoder.column_len(),
-            PostgresDecoder::Jsonb(ref decoder) => decoder.column_len(),
-            PostgresDecoder::List(ref decoder) => decoder.column_len(),
         }
     }
 
