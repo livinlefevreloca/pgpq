@@ -7,7 +7,8 @@ use enum_dispatch::enum_dispatch;
 use std::{any::type_name, convert::identity, sync::Arc};
 
 use crate::error::ErrorKind;
-use crate::pg_schema::{Column, PostgresType, TypeSize};
+use crate::numeric::string_to_numeric;
+use crate::pg_schema::{Column, PostgresType, TypeSize, PG_TYPE_METADATA_KEY};
 
 #[inline]
 pub(crate) fn downcast_checked<'a, T: 'static>(
@@ -493,6 +494,17 @@ impl<'a, T: OffsetSizeTrait> Encode for GenericStringEncoder<'a, T> {
         if self.arr.is_null(row) {
             buf.put_i32(-1);
         } else {
+            if matches!(self.output, StringOutputType::Numeric) {
+                let mut numeric = vec![];
+                string_to_numeric(self.arr.value(row), &mut numeric).map_err(|reason| {
+                    ErrorKind::Encode {
+                        reason: format!("column {}: {reason}", self.field),
+                    }
+                })?;
+                buf.put_i32(numeric.len() as i32);
+                buf.extend_from_slice(&numeric);
+                return Ok(());
+            }
             let v = self.arr.value(row).as_bytes();
             let mut len = v.len();
             if matches!(self.output, StringOutputType::Jsonb) {
@@ -621,7 +633,7 @@ macro_rules! impl_encoder_builder_stateless {
 }
 
 macro_rules! impl_encoder_builder_stateless_with_field {
-    ($struct_name:ident, $enum_name:expr, $encoder_name:ident, $pg_data_type:expr, $check_data_type:expr) => {
+    ($struct_name:ident, $enum_name:expr, $encoder_name:ident, $pg_data_type_for_field:expr, $check_data_type:expr) => {
         impl $struct_name {
             pub fn new(field: Arc<Field>) -> Result<Self, ErrorKind> {
                 if !$check_data_type(field.data_type()) {
@@ -645,7 +657,7 @@ macro_rules! impl_encoder_builder_stateless_with_field {
             }
             fn schema(&self) -> Column {
                 Column {
-                    data_type: $pg_data_type.clone(),
+                    data_type: $pg_data_type_for_field(&self.field),
                     nullable: self.field.is_nullable(),
                 }
             }
@@ -839,6 +851,15 @@ impl_encoder_builder_stateless!(
     |dt: &DataType| matches!(dt, DataType::Float64)
 );
 
+/// A timestamp with a time zone is a timestamptz, and one without is a
+/// timestamp. Both are microseconds in the binary format.
+fn timestamp_type(field: &Field) -> PostgresType {
+    match field.data_type() {
+        DataType::Timestamp(_, Some(timezone)) => PostgresType::TimestampTz(timezone.to_string()),
+        _ => PostgresType::Timestamp,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimestampMicrosecondEncoderBuilder {
     field: Arc<Field>,
@@ -847,7 +868,7 @@ impl_encoder_builder_stateless_with_field!(
     TimestampMicrosecondEncoderBuilder,
     Encoder::TimestampMicrosecond,
     TimestampMicrosecondEncoder,
-    PostgresType::Timestamp,
+    timestamp_type,
     |dt: &DataType| matches!(dt, DataType::Timestamp(TimeUnit::Microsecond, _))
 );
 
@@ -859,7 +880,7 @@ impl_encoder_builder_stateless_with_field!(
     TimestampMillisecondEncoderBuilder,
     Encoder::TimestampMillisecond,
     TimestampMillisecondEncoder,
-    PostgresType::Timestamp,
+    timestamp_type,
     |dt: &DataType| matches!(dt, DataType::Timestamp(TimeUnit::Millisecond, _))
 );
 
@@ -871,7 +892,7 @@ impl_encoder_builder_stateless_with_field!(
     TimestampSecondEncoderBuilder,
     Encoder::TimestampSecond,
     TimestampSecondEncoder,
-    PostgresType::Timestamp,
+    timestamp_type,
     |dt: &DataType| matches!(dt, DataType::Timestamp(TimeUnit::Second, _))
 );
 
@@ -883,7 +904,7 @@ impl_encoder_builder_stateless_with_field!(
     Date32EncoderBuilder,
     Encoder::Date32,
     Date32Encoder,
-    PostgresType::Date,
+    |_: &Field| PostgresType::Date,
     |dt: &DataType| matches!(dt, DataType::Date32)
 );
 
@@ -895,7 +916,7 @@ impl_encoder_builder_stateless_with_field!(
     Time32MillisecondEncoderBuilder,
     Encoder::Time32Millisecond,
     Time32MillisecondEncoder,
-    PostgresType::Time,
+    |_: &Field| PostgresType::Time,
     |dt: &DataType| matches!(dt, DataType::Time32(TimeUnit::Millisecond))
 );
 
@@ -907,7 +928,7 @@ impl_encoder_builder_stateless_with_field!(
     Time32SecondEncoderBuilder,
     Encoder::Time32Second,
     Time32SecondEncoder,
-    PostgresType::Time,
+    |_: &Field| PostgresType::Time,
     |dt: &DataType| matches!(dt, DataType::Time32(TimeUnit::Second))
 );
 
@@ -943,7 +964,7 @@ impl_encoder_builder_stateless_with_field!(
     DurationMillisecondEncoderBuilder,
     Encoder::DurationMillisecond,
     DurationMillisecondEncoder,
-    PostgresType::Interval,
+    |_: &Field| PostgresType::Interval,
     |dt: &DataType| matches!(dt, DataType::Duration(TimeUnit::Millisecond))
 );
 
@@ -955,35 +976,68 @@ impl_encoder_builder_stateless_with_field!(
     DurationSecondEncoderBuilder,
     Encoder::DurationSecond,
     DurationSecondEncoder,
-    PostgresType::Interval,
+    |_: &Field| PostgresType::Interval,
     |dt: &DataType| matches!(dt, DataType::Duration(TimeUnit::Second))
 );
 
 #[derive(Debug, Clone, PartialEq)]
 enum StringOutputType {
     Text,
+    Char,
+    Varchar,
     Json,
     Jsonb,
+    Numeric,
 }
 
 impl StringOutputType {
     pub fn from_postgres_type(tp: PostgresType, field: &Field) -> Result<Self, ErrorKind> {
         match tp {
             PostgresType::Text => Ok(StringOutputType::Text),
+            PostgresType::Char => Ok(StringOutputType::Char),
+            PostgresType::Varchar => Ok(StringOutputType::Varchar),
             PostgresType::Json => Ok(StringOutputType::Json),
             PostgresType::Jsonb => Ok(StringOutputType::Jsonb),
+            PostgresType::Numeric => Ok(StringOutputType::Numeric),
             other => Err(ErrorKind::EncodingNotSupported {
                 field: field.name().clone(),
                 tp: other,
-                allowed: vec![PostgresType::Text, PostgresType::Json, PostgresType::Jsonb],
+                allowed: vec![
+                    PostgresType::Text,
+                    PostgresType::Char,
+                    PostgresType::Varchar,
+                    PostgresType::Json,
+                    PostgresType::Jsonb,
+                    PostgresType::Numeric,
+                ],
             }),
         }
     }
+    /// The output for a string field whose metadata names a Postgres type.
+    fn from_typname(typname: &str, field: &Field) -> Result<Self, ErrorKind> {
+        match typname {
+            "text" => Ok(StringOutputType::Text),
+            "bpchar" => Ok(StringOutputType::Char),
+            "varchar" => Ok(StringOutputType::Varchar),
+            "json" => Ok(StringOutputType::Json),
+            "jsonb" => Ok(StringOutputType::Jsonb),
+            "numeric" => Ok(StringOutputType::Numeric),
+            _ => Err(ErrorKind::MetadataTypeMismatch {
+                field: field.name().clone(),
+                pg_type: typname.to_string(),
+                data_type: field.data_type().clone(),
+            }),
+        }
+    }
+
     pub fn postgres_datatype(&self) -> PostgresType {
         match self {
             StringOutputType::Text => PostgresType::Text,
+            StringOutputType::Char => PostgresType::Char,
+            StringOutputType::Varchar => PostgresType::Varchar,
             StringOutputType::Json => PostgresType::Json,
             StringOutputType::Jsonb => PostgresType::Jsonb,
+            StringOutputType::Numeric => PostgresType::Numeric,
         }
     }
 }
@@ -1068,7 +1122,7 @@ impl_encoder_builder_stateless_with_field!(
     BinaryEncoderBuilder,
     Encoder::Binary,
     BinaryEncoder,
-    PostgresType::Bytea,
+    |_: &Field| PostgresType::Bytea,
     |dt: &DataType| matches!(dt, DataType::Binary)
 );
 
@@ -1080,7 +1134,7 @@ impl_encoder_builder_stateless_with_field!(
     LargeBinaryEncoderBuilder,
     Encoder::LargeBinary,
     LargeBinaryEncoder,
-    PostgresType::Bytea,
+    |_: &Field| PostgresType::Bytea,
     |dt: &DataType| matches!(dt, DataType::LargeBinary)
 );
 
@@ -1198,7 +1252,35 @@ pub enum EncoderBuilder {
 }
 
 impl EncoderBuilder {
+    /// Picks the encoder for a field.
+    ///
+    /// When the field's metadata names a Postgres type, the encoder writes that
+    /// type, and a field whose Arrow type cannot be encoded as it is an error.
+    /// Without metadata, the Postgres type is inferred from the Arrow type.
     pub fn try_new(field: Arc<Field>) -> Result<Self, ErrorKind> {
+        let builder = Self::for_arrow_type(field.clone())?;
+        let Some(pg_type) = field.metadata().get(PG_TYPE_METADATA_KEY) else {
+            return Ok(builder);
+        };
+
+        let encoded = builder.schema().data_type.typname();
+        if encoded.as_ref() != Some(pg_type) {
+            return Err(ErrorKind::MetadataTypeMismatch {
+                field: field.name().clone(),
+                pg_type: pg_type.clone(),
+                data_type: field.data_type().clone(),
+            });
+        }
+        Ok(builder)
+    }
+
+    fn for_arrow_type(field: Arc<Field>) -> Result<Self, ErrorKind> {
+        let string_output = match field.metadata().get(PG_TYPE_METADATA_KEY) {
+            Some(typname) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => {
+                StringOutputType::from_typname(typname, &field)?
+            }
+            _ => StringOutputType::Text,
+        };
         let data_type = field.data_type();
         let res = match data_type {
             DataType::Boolean => Self::Boolean(BooleanEncoderBuilder { field }),
@@ -1271,11 +1353,11 @@ impl EncoderBuilder {
             },
             DataType::Utf8 => Self::String(StringEncoderBuilder {
                 field,
-                output: StringOutputType::Text,
+                output: string_output,
             }),
             DataType::LargeUtf8 => Self::LargeString(LargeStringEncoderBuilder {
                 field,
-                output: StringOutputType::Text,
+                output: string_output,
             }),
             DataType::Binary => Self::Binary(BinaryEncoderBuilder { field }),
             DataType::LargeBinary | DataType::FixedSizeBinary(_) => {

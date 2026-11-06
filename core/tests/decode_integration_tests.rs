@@ -1,7 +1,9 @@
-use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch};
 use arrow_ipc::reader::FileReader;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use pgpq::error::ErrorKind;
+use pgpq::pg_schema::PG_TYPE_METADATA_KEY;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -23,6 +25,36 @@ fn read_arrow_file(path: PathBuf) -> Vec<RecordBatch> {
     reader.collect::<Result<Vec<_>, _>>().unwrap()
 }
 
+/// Removes the Postgres type metadata the decoder adds, since the expected
+/// Arrow files were written without it.
+fn without_pg_metadata(batch: &RecordBatch) -> RecordBatch {
+    let mut fields = vec![];
+    let mut columns: Vec<ArrayRef> = vec![];
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let column: ArrayRef = match field.data_type() {
+            DataType::List(element) => {
+                let list = column.as_list::<i32>();
+                let element = element.as_ref().clone().with_metadata(Default::default());
+                Arc::new(ListArray::new(
+                    Arc::new(element),
+                    list.offsets().clone(),
+                    list.values().clone(),
+                    list.nulls().cloned(),
+                ))
+            }
+            _ => column.clone(),
+        };
+        let field = Field::new(
+            field.name(),
+            column.data_type().clone(),
+            field.is_nullable(),
+        );
+        fields.push(field);
+        columns.push(column);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
 fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/snapshots/{case}.bin"));
@@ -36,9 +68,20 @@ fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
     let schema = read_schema_file(schema_path, timezone);
     println!("Schema: {:?}", schema);
 
-    let mut decoder = PostgresBinaryToArrowReader::new(schema, reader, READ_CHUNK_SIZE).unwrap();
+    let mut decoder =
+        PostgresBinaryToArrowReader::new(schema.clone(), reader, READ_CHUNK_SIZE).unwrap();
     decoder.read_header()?;
     let batches = decoder.decode_batches()?;
+
+    for batch in &batches {
+        for (field, (_, column)) in batch.schema().fields().iter().zip(schema.iter()) {
+            assert_eq!(
+                field.metadata().get(PG_TYPE_METADATA_KEY),
+                column.data_type.typname().as_ref(),
+            );
+        }
+    }
+    let batches = batches.iter().map(without_pg_metadata).collect::<Vec<_>>();
 
     let mut expected_batches = read_arrow_file(arrow_path);
 

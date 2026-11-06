@@ -36,6 +36,14 @@ pub enum ErrorKind {
         tp: DataType,
         field: String,
     },
+    #[error(
+        "Field {field} has Postgres type {pg_type} in its metadata, which cannot be encoded from Arrow type {data_type}"
+    )]
+    MetadataTypeMismatch {
+        field: String,
+        pg_type: String,
+        data_type: DataType,
+    },
     #[error("Missing encoder for field {field}")]
     EncoderMissing { field: String },
     #[error("No fields match supplied encoder fields: {fields:?}")]

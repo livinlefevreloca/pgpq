@@ -10,6 +10,7 @@ mod buffer_view;
 pub mod decoders;
 pub mod encoders;
 pub mod error;
+mod numeric;
 pub mod pg_schema;
 
 use crate::buffer_view::BufferView;
