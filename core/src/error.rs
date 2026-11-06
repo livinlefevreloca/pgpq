@@ -44,6 +44,8 @@ pub enum ErrorKind {
         pg_type: String,
         data_type: DataType,
     },
+    #[error("Invalid schema JSON: {reason}")]
+    InvalidSchemaJson { reason: String },
     #[error("Missing encoder for field {field}")]
     EncoderMissing { field: String },
     #[error("No fields match supplied encoder fields: {fields:?}")]

@@ -1,5 +1,6 @@
 use crate::utils::PythonRepr;
 use pyo3::class::basic::CompareOp;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyNotImplemented;
 
@@ -469,6 +470,38 @@ impl PostgresSchema {
     #[new]
     fn new(columns: Vec<(String, Column)>) -> Self {
         Self { columns }
+    }
+    /// Builds a schema from catalog rows of (name, type schema, typname,
+    /// nullable), one per column in order.
+    #[staticmethod]
+    #[pyo3(signature = (columns, timezone = pgpq::pg_schema::DEFAULT_TIMEZONE.to_string()))]
+    fn from_catalog(
+        columns: Vec<(String, String, String, bool)>,
+        timezone: String,
+    ) -> PyResult<Self> {
+        let rows: Vec<pgpq::pg_schema::CatalogColumn> = columns
+            .into_iter()
+            .map(
+                |(name, type_schema, typname, nullable)| pgpq::pg_schema::CatalogColumn {
+                    name,
+                    type_schema,
+                    typname,
+                    nullable,
+                },
+            )
+            .collect();
+        pgpq::pg_schema::PostgresSchema::from_catalog(&rows, &timezone)
+            .map(Into::into)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+    fn to_json(&self) -> String {
+        pgpq::pg_schema::PostgresSchema::from(self.clone()).to_json()
+    }
+    #[staticmethod]
+    fn from_json(json: &str) -> PyResult<Self> {
+        pgpq::pg_schema::PostgresSchema::from_json(json)
+            .map(Into::into)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
     fn __repr__(&self, py: Python) -> String {
         self.py_repr(py)

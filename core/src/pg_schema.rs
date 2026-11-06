@@ -9,6 +9,13 @@ use std::sync::Arc;
 /// went through Arrow or Parquet loads back into the type it came from.
 pub const PG_TYPE_METADATA_KEY: &str = "pg_type";
 
+/// The time zone of a timestamptz column when none is given.
+pub const DEFAULT_TIMEZONE: &str = "UTC";
+
+/// The schema of the catalog's built-in types. Extension and user-defined
+/// types live in other schemas and have no decoder yet.
+const BUILTIN_TYPE_SCHEMA: &str = "pg_catalog";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeSize {
     Fixed(usize),
@@ -153,10 +160,18 @@ impl PostgresType {
         Some(name.to_string())
     }
 
-    /// The Postgres type a field's metadata names, with the parts the name
-    /// leaves out, an array's element and a timestamptz's time zone, taken
-    /// from the field's Arrow type.
-    fn from_typname(typname: &str, field: &Field) -> Result<Self, ErrorKind> {
+    /// The time zone of a timestamptz, or of the elements of a timestamptz array.
+    pub fn timezone(&self) -> Option<&str> {
+        match self {
+            PostgresType::TimestampTz(timezone) => Some(timezone),
+            PostgresType::List((_, column)) => column.data_type.timezone(),
+            _ => None,
+        }
+    }
+
+    /// The scalar type with this pg_type.typname, or None for an array or a
+    /// type with no decoder. A timestamptz takes the given time zone.
+    fn from_scalar_typname(typname: &str, timezone: &str) -> Option<Self> {
         let pg_type = match typname {
             "bool" => PostgresType::Bool,
             "bytea" => PostgresType::Bytea,
@@ -174,33 +189,39 @@ impl PostgresType {
             "date" => PostgresType::Date,
             "time" => PostgresType::Time,
             "timestamp" => PostgresType::Timestamp,
-            "timestamptz" => match field.data_type() {
-                DataType::Timestamp(_, Some(timezone)) => {
-                    PostgresType::TimestampTz(timezone.to_string())
-                }
-                _ => PostgresType::TimestampTz("UTC".to_string()),
-            },
+            "timestamptz" => PostgresType::TimestampTz(timezone.to_string()),
             "interval" => PostgresType::Interval,
-            array if array.starts_with('_') => match field.data_type() {
-                DataType::List(element) | DataType::LargeList(element) => PostgresType::List((
+            _ => return None,
+        };
+        Some(pg_type)
+    }
+
+    /// The Postgres type a field's metadata names, with the parts the name
+    /// leaves out, an array's element and a timestamptz's time zone, taken
+    /// from the field's Arrow type.
+    fn from_typname(typname: &str, field: &Field) -> Result<Self, ErrorKind> {
+        if typname.starts_with('_') {
+            return match field.data_type() {
+                DataType::List(element) | DataType::LargeList(element) => Ok(PostgresType::List((
                     element.name().to_string(),
                     Box::new(Column::try_from(element.as_ref())?),
-                )),
-                other => {
-                    return Err(ErrorKind::MetadataTypeMismatch {
-                        field: field.name().to_string(),
-                        pg_type: typname.to_string(),
-                        data_type: other.clone(),
-                    })
-                }
-            },
-            _ => {
-                return Err(ErrorKind::UnsupportedColumnType {
-                    typ: typname.to_string(),
-                })
-            }
+                ))),
+                other => Err(ErrorKind::MetadataTypeMismatch {
+                    field: field.name().to_string(),
+                    pg_type: typname.to_string(),
+                    data_type: other.clone(),
+                }),
+            };
+        }
+        let timezone = match field.data_type() {
+            DataType::Timestamp(_, Some(timezone)) => timezone.to_string(),
+            _ => DEFAULT_TIMEZONE.to_string(),
         };
-        Ok(pg_type)
+        PostgresType::from_scalar_typname(typname, &timezone).ok_or_else(|| {
+            ErrorKind::UnsupportedColumnType {
+                typ: typname.to_string(),
+            }
+        })
     }
 }
 
@@ -282,6 +303,27 @@ impl Column {
             }
             None => field,
         }
+    }
+
+    /// A column from its type's name in pg_type.typname. An array is named
+    /// after its element with a leading underscore, as in the catalog.
+    pub fn from_typname(typname: &str, nullable: bool, timezone: &str) -> Result<Self, ErrorKind> {
+        let data_type = match typname.strip_prefix('_') {
+            // Arrow's usual name for a list's element field.
+            Some(element) => PostgresType::List((
+                "item".to_string(),
+                Box::new(Column::from_typname(element, true, timezone)?),
+            )),
+            None => PostgresType::from_scalar_typname(typname, timezone).ok_or_else(|| {
+                ErrorKind::UnsupportedColumnType {
+                    typ: typname.to_string(),
+                }
+            })?,
+        };
+        Ok(Column {
+            data_type,
+            nullable,
+        })
     }
 
     pub fn from_parts(
@@ -381,6 +423,17 @@ impl Column {
     }
 }
 
+/// One column of a table or query as the catalog describes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogColumn {
+    pub name: String,
+    /// The schema the column's type belongs to, pg_namespace.nspname.
+    pub type_schema: String,
+    /// The type's pg_type.typname. An array type's name starts with an underscore.
+    pub typname: String,
+    pub nullable: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PostgresSchema {
     pub columns: Vec<(String, Column)>,
@@ -456,6 +509,77 @@ impl PostgresSchema {
             .map(|columns| PostgresSchema { columns })?;
 
         Ok(schema)
+    }
+
+    /// Builds a schema from catalog rows, one per column in order. Domains
+    /// must already be resolved to their base types.
+    pub fn from_catalog(columns: &[CatalogColumn], timezone: &str) -> Result<Self, ErrorKind> {
+        let columns = columns
+            .iter()
+            .map(|column| {
+                if column.type_schema != BUILTIN_TYPE_SCHEMA {
+                    return Err(ErrorKind::UnsupportedColumnType {
+                        typ: format!(
+                            "{}.{} (column {})",
+                            column.type_schema, column.typname, column.name
+                        ),
+                    });
+                }
+                let col = Column::from_typname(&column.typname, column.nullable, timezone)
+                    .map_err(|_| ErrorKind::UnsupportedColumnType {
+                        typ: format!("{} (column {})", column.typname, column.name),
+                    })?;
+                Ok((column.name.clone(), col))
+            })
+            .collect::<Result<Vec<_>, ErrorKind>>()?;
+        Ok(PostgresSchema { columns })
+    }
+
+    /// The schema as JSON: a list of columns, each with its name, its type's
+    /// pg_type.typname, whether it is nullable and, for timestamptz and its
+    /// arrays, its time zone.
+    pub fn to_json(&self) -> String {
+        let columns: Vec<serde_json::Value> = self
+            .columns
+            .iter()
+            .map(|(name, column)| {
+                let mut entry = serde_json::json!({
+                    "name": name,
+                    "type": column.data_type.typname(),
+                    "nullable": column.nullable,
+                });
+                if let Some(timezone) = column.data_type.timezone() {
+                    entry["timezone"] = serde_json::Value::from(timezone);
+                }
+                entry
+            })
+            .collect();
+        serde_json::Value::from(columns).to_string()
+    }
+
+    /// Reads a schema written by to_json.
+    pub fn from_json(json: &str) -> Result<Self, ErrorKind> {
+        let invalid = |reason: String| ErrorKind::InvalidSchemaJson { reason };
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_str(json).map_err(|e| invalid(e.to_string()))?;
+        let columns = entries
+            .iter()
+            .map(|entry| {
+                let text = |key: &str| {
+                    entry[key]
+                        .as_str()
+                        .ok_or_else(|| invalid(format!("{key} must be a string in {entry}")))
+                };
+                let name = text("name")?;
+                let nullable = entry["nullable"]
+                    .as_bool()
+                    .ok_or_else(|| invalid(format!("nullable must be a boolean in {entry}")))?;
+                let timezone = entry["timezone"].as_str().unwrap_or(DEFAULT_TIMEZONE);
+                let column = Column::from_typname(text("type")?, nullable, timezone)?;
+                Ok((name.to_string(), column))
+            })
+            .collect::<Result<Vec<_>, ErrorKind>>()?;
+        Ok(PostgresSchema { columns })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &(String, Column)> {
