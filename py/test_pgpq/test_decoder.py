@@ -17,7 +17,7 @@ import pgpq
 from pgpq.schema import (
     Bool,
     Bytea,
-    Char,
+    Varchar,
     Column,
     Date,
     Float4,
@@ -52,7 +52,7 @@ COLUMNS = [
     ("ratio", "float8", Column(True, Float8())),
     ("ratio4", "float4", Column(True, Float4())),
     ("name", "text", Column(True, Text())),
-    ("code", "varchar(20)", Column(True, Char())),
+    ("code", "varchar(20)", Column(True, Varchar())),
     ("doc", "jsonb", Column(True, Jsonb())),
     ("raw_doc", "json", Column(True, Json())),
     ("amount", "numeric", Column(True, Numeric())),
@@ -64,6 +64,9 @@ COLUMNS = [
     ("blob", "bytea", Column(True, Bytea())),
     ("tags", "text[]", Column(True, PgList(Column(True, Text())))),
     ("scores", "int4[]", Column(True, PgList(Column(True, Int4())))),
+    ("docs", "jsonb[]", Column(True, PgList(Column(True, Jsonb())))),
+    ("raw_docs", "json[]", Column(True, PgList(Column(True, Json())))),
+    ("stamps", "timestamptz[]", Column(True, PgList(Column(True, TimestampTz("UTC"))))),
 ]
 
 SCHEMA = PostgresSchema([(name, column) for name, _, column in COLUMNS])
@@ -97,7 +100,14 @@ SELECT
     CASE WHEN i % 7 = 0 THEN NULL ELSE i * interval '1 day 3 hours' END,
     CASE WHEN i % 7 = 0 THEN NULL ELSE decode(lpad(to_hex(i), 8, '0'), 'hex') END,
     CASE WHEN i % 7 = 0 THEN NULL ELSE ARRAY['t' || i, NULL, 'u'] END,
-    CASE WHEN i % 7 = 0 THEN NULL ELSE ARRAY[i, i + 1] END
+    CASE WHEN i % 7 = 0 THEN NULL ELSE ARRAY[i, i + 1] END,
+    CASE WHEN i % 7 = 0 THEN NULL
+        ELSE ARRAY[jsonb_build_object('id', i), NULL] END,
+    CASE WHEN i % 7 = 0 THEN NULL
+        ELSE ARRAY[json_build_object('id', i), NULL] END,
+    CASE WHEN i % 7 = 0 THEN NULL
+        ELSE ARRAY[timestamptz '2024-01-01 12:00+00' + i * interval '1 minute', NULL]
+    END
 FROM generate_series(1, {ROW_COUNT}) AS i
 """
 
@@ -150,6 +160,13 @@ def normalize_db_row(row: Tuple[Any, ...]) -> Tuple[Any, ...]:
         index = names.index(column)
         if values[index] is not None:
             values[index] = json.dumps(values[index], sort_keys=True)
+    for column in ("docs", "raw_docs"):
+        index = names.index(column)
+        if values[index] is not None:
+            values[index] = [
+                None if doc is None else json.dumps(doc, sort_keys=True)
+                for doc in values[index]
+            ]
     blob = names.index("blob")
     if values[blob] is not None:
         values[blob] = bytes(values[blob])
@@ -167,6 +184,17 @@ def batch_rows(batches: List[pa.RecordBatch]) -> List[Tuple[Any, ...]]:
                 index = names.index(column)
                 if row[index] is not None:
                     row[index] = json.dumps(json.loads(row[index]), sort_keys=True)
+            for column in ("docs", "raw_docs"):
+                index = names.index(column)
+                if row[index] is not None:
+                    row[index] = [
+                        (
+                            None
+                            if doc is None
+                            else json.dumps(json.loads(doc), sort_keys=True)
+                        )
+                        for doc in row[index]
+                    ]
             amount = names.index("amount")
             if row[amount] is not None:
                 row[amount] = Decimal(row[amount])
@@ -275,6 +303,125 @@ def test_all_null_batches_write_to_one_parquet_file(
             writer.write_batch(batch)
 
     assert batch_rows(pq.read_table(path).to_batches()) == expected_rows
+
+
+def test_decoded_batches_load_back_into_postgres(
+    tmp_path: Path, dbconn: Connection, copy_bytes: bytes
+) -> None:
+    columns = [(name, pg_type) for name, pg_type, _ in COLUMNS]
+    names = ", ".join(name for name, _ in columns)
+    # json has no equality operator, so it is compared as text.
+    comparable = ", ".join(
+        f"{name}::text" if pg_type.startswith("json") else name
+        for name, pg_type in columns
+    )
+    batches = pgpq.decode_bytes(copy_bytes, SCHEMA, batch_size=64)
+
+    # Parquet keeps the field metadata, so the load needs no schema.
+    path = tmp_path / "decoded.parquet"
+    pq.write_table(pa.Table.from_batches(batches), path)
+    table = pq.read_table(path)
+
+    encoder = pgpq.ArrowToPostgresBinaryEncoder(table.schema)
+    buffer = bytearray(encoder.write_header())
+    for batch in table.to_batches():
+        buffer.extend(encoder.write_batch(batch))
+    buffer.extend(encoder.finish())
+
+    ddl = ", ".join(f"{name} {pg_type}" for name, pg_type in columns)
+    try:
+        with dbconn.cursor() as cursor:
+            cursor.execute(f"CREATE TEMP TABLE decode_target ({ddl})")
+            with cursor.copy(
+                f"COPY decode_target ({names}) FROM STDIN WITH (FORMAT binary)"
+            ) as copy:
+                copy.write(bytes(buffer))
+            cursor.execute(
+                f"SELECT {comparable} FROM decode_source "
+                f"EXCEPT ALL SELECT {comparable} FROM decode_target"
+            )
+            missing = cursor.fetchall()
+            cursor.execute("SELECT count(*) FROM decode_target")
+            (loaded,) = cursor.fetchone()  # type: ignore[misc]
+            cursor.execute(
+                "SELECT pg_typeof(doc)::text, pg_typeof(raw_doc)::text "
+                "FROM decode_target LIMIT 1"
+            )
+            types = cursor.fetchone()
+    finally:
+        dbconn.rollback()
+
+    assert missing == []
+    assert loaded == ROW_COUNT
+    assert types == ("jsonb", "json")
+
+
+NUMERIC_VALUES = [
+    "0",
+    "0.00",
+    "1.50",
+    "-1.50",
+    "100",
+    "10000",
+    "0.0001",
+    "-0.000123",
+    "123456789012345678901234567890.123456789",
+    "1e-20",
+    "1.5e30",
+    "NaN",
+    "Infinity",
+    "-Infinity",
+    None,
+]
+
+
+def test_numeric_round_trips_through_postgres(dbconn: Connection) -> None:
+    schema = PostgresSchema([("value", Column(True, Numeric()))])
+    try:
+        with dbconn.cursor() as cursor:
+            cursor.execute("CREATE TEMP TABLE numeric_source (id int, value numeric)")
+            for i, value in enumerate(NUMERIC_VALUES):
+                cursor.execute(
+                    "INSERT INTO numeric_source VALUES (%s, %s::numeric)", (i, value)
+                )
+            cursor.execute("SELECT value::text FROM numeric_source ORDER BY id")
+            expected = [value for (value,) in cursor.fetchall()]
+            with cursor.copy(
+                "COPY (SELECT value FROM numeric_source ORDER BY id) "
+                "TO STDOUT WITH (FORMAT binary)"
+            ) as copy:
+                data = b"".join(bytes(chunk) for chunk in copy)
+
+            batches = pgpq.decode_bytes(data, schema)
+            decoded = [v for batch in batches for v in batch.column(0).to_pylist()]
+
+            encoder = pgpq.ArrowToPostgresBinaryEncoder(batches[0].schema)
+            buffer = bytearray(encoder.write_header())
+            for batch in batches:
+                buffer.extend(encoder.write_batch(batch))
+            buffer.extend(encoder.finish())
+            cursor.execute("CREATE TEMP TABLE numeric_target (value numeric)")
+            with cursor.copy(
+                "COPY numeric_target FROM STDIN WITH (FORMAT binary)"
+            ) as copy:
+                copy.write(bytes(buffer))
+            cursor.execute("SELECT value::text FROM numeric_target")
+            loaded = [value for (value,) in cursor.fetchall()]
+    finally:
+        dbconn.rollback()
+
+    assert decoded == expected
+    assert loaded == expected
+
+
+def test_invalid_numeric_string_raises_encode_error() -> None:
+    field = pa.field("value", pa.string(), metadata={"pg_type": "numeric"})
+    batch = pa.record_batch([pa.array(["1.5", "abc"])], schema=pa.schema([field]))
+    encoder = pgpq.ArrowToPostgresBinaryEncoder(batch.schema)
+    encoder.write_header()
+
+    with pytest.raises(pgpq.EncodeError, match="abc"):
+        encoder.write_batch(batch)
 
 
 def test_truncated_stream_raises(copy_bytes: bytes) -> None:

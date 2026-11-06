@@ -87,6 +87,11 @@ impl_simple!(Char, pgpq::pg_schema::PostgresType::Char);
 
 #[pyclass(module = "pgpq._pgpq")]
 #[derive(Debug, Clone, PartialEq)]
+pub struct Varchar;
+impl_simple!(Varchar, pgpq::pg_schema::PostgresType::Varchar);
+
+#[pyclass(module = "pgpq._pgpq")]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Text;
 impl_simple!(Text, pgpq::pg_schema::PostgresType::Text);
 
@@ -262,6 +267,7 @@ pub enum PostgresType {
     Int4(Int4),
     Int8(Int8),
     Char(Char),
+    Varchar(Varchar),
     Text(Text),
     Json(Json),
     Jsonb(Jsonb),
@@ -285,6 +291,7 @@ impl From<PostgresType> for pgpq::pg_schema::PostgresType {
             PostgresType::Int4(inner) => inner.into(),
             PostgresType::Int8(inner) => inner.into(),
             PostgresType::Char(inner) => inner.into(),
+            PostgresType::Varchar(inner) => inner.into(),
             PostgresType::Text(inner) => inner.into(),
             PostgresType::Json(inner) => inner.into(),
             PostgresType::Jsonb(inner) => inner.into(),
@@ -310,6 +317,7 @@ impl From<pgpq::pg_schema::PostgresType> for PostgresType {
             pgpq::pg_schema::PostgresType::Int4 => PostgresType::Int4(Int4),
             pgpq::pg_schema::PostgresType::Int8 => PostgresType::Int8(Int8),
             pgpq::pg_schema::PostgresType::Char => PostgresType::Char(Char),
+            pgpq::pg_schema::PostgresType::Varchar => PostgresType::Varchar(Varchar),
             pgpq::pg_schema::PostgresType::Text => PostgresType::Text(Text),
             pgpq::pg_schema::PostgresType::Json => PostgresType::Json(Json),
             pgpq::pg_schema::PostgresType::Jsonb => PostgresType::Jsonb(Jsonb),
@@ -340,6 +348,7 @@ impl PythonRepr for PostgresType {
             PostgresType::Int4(inner) => inner.py_repr(py),
             PostgresType::Int8(inner) => inner.py_repr(py),
             PostgresType::Char(inner) => inner.py_repr(py),
+            PostgresType::Varchar(inner) => inner.py_repr(py),
             PostgresType::Text(inner) => inner.py_repr(py),
             PostgresType::Json(inner) => inner.py_repr(py),
             PostgresType::Jsonb(inner) => inner.py_repr(py),
@@ -382,6 +391,7 @@ impl Column {
             PostgresType::Int4(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
             PostgresType::Int8(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
             PostgresType::Char(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
+            PostgresType::Varchar(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
             PostgresType::Text(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
             PostgresType::Json(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),
             PostgresType::Jsonb(inner) => inner.clone().into_pyobject(py)?.into_any().unbind(),

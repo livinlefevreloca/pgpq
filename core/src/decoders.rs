@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::buffer_view::BufferView;
 use crate::encoders::{PG_BASE_DATE_OFFSET, PG_BASE_TIMESTAMP_OFFSET_US};
 use crate::error::ErrorKind;
+use crate::numeric::numeric_to_string;
 use crate::pg_schema::{Column, PostgresSchema, PostgresType};
 
 /// Trait defining the methods needed to decode a Postgres type into an Arrow array
@@ -465,136 +466,6 @@ impl_decode_variable_size!(
     i32
 );
 
-// const used for stringifying postgres decimals
-const DEC_DIGITS: i16 = 4;
-// const used for determining sign of numeric
-const NUMERIC_NEG: i16 = 0x4000;
-
-/// Parse a Postgres numeric type in binary format into a string
-fn parse_pg_decimal_to_string(data: Vec<u8>) -> Result<String, ErrorKind> {
-    // Logic ported from src/backend/utils/adt/numeric.c:get_str_from_var
-    // Decimals will be decoded to strings since rust does not have a ubiquitos
-    // decimal type and arrow does not implment `From` for any of them. Arrow
-    // does have a Decimal128 array but its only accepts i128s as input
-    // TODO: Seems like there could be a fast path here for simpler numbers
-    let ndigits = i16::from_be_bytes(data[0..2].try_into().unwrap());
-    let weight = i16::from_be_bytes(data[2..4].try_into().unwrap());
-    let sign = i16::from_be_bytes(data[4..6].try_into().unwrap());
-    let scale = i16::from_be_bytes(data[6..8].try_into().unwrap());
-    let digits: Vec<i16> = data[8..8 + (ndigits as usize) * (std::mem::size_of::<i16>())]
-        .chunks(2)
-        .map(|c| i16::from_be_bytes(c.try_into().unwrap()))
-        .collect();
-
-    // the number of digits before the decimal place
-    let pre_decimal = (weight + 1) * DEC_DIGITS;
-
-    // scale is the number digits after the decimal place.
-    // 2 is for a possible sign and decimal point
-    let str_len: usize = (pre_decimal + DEC_DIGITS + 2 + scale) as usize;
-
-    // -1 because we dont need to account for the null terminator
-    let mut decimal: Vec<u8> = Vec::with_capacity(str_len - 1);
-
-    // put a negative sign if the numeric is negative
-    if sign == NUMERIC_NEG {
-        decimal.push(b'-');
-    }
-
-    let mut digits_index = 0;
-    // If weight is less than 0 we have a fractional number.
-    // Put a 0 before the decimal.
-    if weight < 0 {
-        decimal.push(b'0');
-    // Otherwise put digits in the decimal string by computing the value for each place in decimal
-    } else {
-        while digits_index <= weight {
-            let mut dig = if digits_index < ndigits {
-                digits[digits_index as usize]
-            } else {
-                0
-            };
-            let mut putit = digits_index > 0;
-
-            /* below unwraps too:
-                d1 = dig / 1000;
-                dig -= d1 * 1000;
-                putit |= (d1 > 0);
-                if (putit)
-                    *cp++ = d1 + '0';
-                d1 = dig / 100;
-                dig -= d1 * 100;
-                putit |= (d1 > 0);
-                if (putit)
-                    *cp++ = d1 + '0';
-                d1 = dig / 10;
-                dig -= d1 * 10;
-                putit |= (d1 > 0);
-                if (putit)
-                    *cp++ = d1 + '0';
-                *cp++ = dig + '0';
-            */
-
-            let mut place = 1000;
-            while place > 1 {
-                let d1 = dig / place;
-                dig -= d1 * place;
-                putit |= d1 > 0;
-                if putit {
-                    decimal.push(d1 as u8 + b'0');
-                }
-                place /= 10;
-            }
-            decimal.push(dig as u8 + b'0');
-            digits_index += 1;
-        }
-    }
-    // If scale is > 0 we have digits after the decimal point
-    if scale > 0 {
-        decimal.push(b'.');
-    }
-    while digits_index < ndigits {
-        let mut dig = if digits_index >= 0 && digits_index < ndigits {
-            digits[digits_index as usize]
-        } else {
-            0
-        };
-        let mut place = 1000;
-        // Same as the loop above but no putit since all digits prior to the
-        // scale-TH digit are significant
-        while place > 1 {
-            let d1 = dig / place;
-            dig -= d1 * place;
-            decimal.push(d1 as u8 + b'0');
-            place /= 10;
-        }
-        decimal.push(dig as u8 + b'0');
-        digits_index += 1;
-    }
-
-    // trim trailing zeros and return the string
-    Ok(truncate_and_finalize(decimal, scale))
-}
-
-/// truncate any trailing zeros on end of the string if they not significant.
-/// If the number ends in a decimal point, add a zero
-fn truncate_and_finalize(mut v: Vec<u8>, scale: i16) -> String {
-    // if there is a decimal point do some general cleanup
-    let decimal_point_idx = v.iter().position(|&c| c == b'.');
-    if let Some(idx) = decimal_point_idx {
-        // If the number ends in a decimal point, add a zero
-        if idx == v.len() - 1 {
-            v.push(b'0')
-        // Strip any trailing zeros after the decimal point
-        } else {
-            while v.len() - idx - 1 > scale as usize {
-                v.pop();
-            }
-        }
-    };
-    String::from_utf8(v).unwrap()
-}
-
 #[derive(Debug)]
 pub struct NumericDecoder {
     name: String,
@@ -603,7 +474,7 @@ pub struct NumericDecoder {
 
 impl_decode_variable_size!(
     NumericDecoder,
-    parse_pg_decimal_to_string,
+    |data: Vec<u8>| numeric_to_string(&data),
     0,
     GenericStringArray,
     i32
@@ -794,12 +665,13 @@ impl PostgresDecoder {
                     arr: vec![],
                 })
             }
-            PostgresType::Text | PostgresType::Char | PostgresType::Json => {
-                PostgresDecoder::String(StringDecoder {
-                    name: name.to_string(),
-                    arr: vec![],
-                })
-            }
+            PostgresType::Text
+            | PostgresType::Char
+            | PostgresType::Varchar
+            | PostgresType::Json => PostgresDecoder::String(StringDecoder {
+                name: name.to_string(),
+                arr: vec![],
+            }),
             PostgresType::Jsonb => PostgresDecoder::Jsonb(JsonbDecoder {
                 name: name.to_string(),
                 arr: vec![],

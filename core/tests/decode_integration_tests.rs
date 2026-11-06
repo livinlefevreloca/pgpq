@@ -1,6 +1,7 @@
-use arrow_array::RecordBatch;
+use arrow::compute::cast;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::reader::FileReader;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use pgpq::error::ErrorKind;
 use std::fs::File;
 use std::io::BufReader;
@@ -23,6 +24,43 @@ fn read_arrow_file(path: PathBuf) -> Vec<RecordBatch> {
     reader.collect::<Result<Vec<_>, _>>().unwrap()
 }
 
+/// Adds the Postgres types the decoder writes to an expected batch. The Arrow
+/// files carry no metadata because they are also the encoder tests' inputs,
+/// and those tests check that the encoder infers types without it.
+fn with_pg_metadata(batch: &RecordBatch, schema: &PostgresSchema) -> RecordBatch {
+    let mut fields = vec![];
+    let mut columns: Vec<ArrayRef> = vec![];
+    let expected = batch.schema();
+    for ((field, column), (name, pg_column)) in expected
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .zip(schema.iter())
+    {
+        let decoded = pg_column.to_field(name);
+        // A list's element field carries its own type, so the list's data type
+        // changes too, and the column is cast to it.
+        let data_type = match (field.data_type(), decoded.data_type()) {
+            (DataType::List(element), DataType::List(decoded_element)) => DataType::List(Arc::new(
+                element
+                    .as_ref()
+                    .clone()
+                    .with_metadata(decoded_element.metadata().clone()),
+            )),
+            (data_type, _) => data_type.clone(),
+        };
+        columns.push(cast(column, &data_type).unwrap());
+        fields.push(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(data_type)
+                .with_metadata(decoded.metadata().clone()),
+        );
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
 fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/snapshots/{case}.bin"));
@@ -36,7 +74,8 @@ fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
     let schema = read_schema_file(schema_path, timezone);
     println!("Schema: {:?}", schema);
 
-    let mut decoder = PostgresBinaryToArrowReader::new(schema, reader, READ_CHUNK_SIZE).unwrap();
+    let mut decoder =
+        PostgresBinaryToArrowReader::new(schema.clone(), reader, READ_CHUNK_SIZE).unwrap();
     decoder.read_header()?;
     let batches = decoder.decode_batches()?;
 
@@ -86,6 +125,11 @@ fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
             })
             .collect::<Vec<_>>();
     }
+
+    let expected_batches = expected_batches
+        .iter()
+        .map(|batch| with_pg_metadata(batch, &schema))
+        .collect::<Vec<_>>();
 
     assert_eq!(
         batches.iter().map(|b| b.num_rows()).sum::<usize>(),

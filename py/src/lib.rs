@@ -34,9 +34,9 @@ impl ArrowToPostgresBinaryEncoder {
     #[new]
     fn new(_py: Python, pyschema: &Bound<'_, PyAny>) -> PyResult<Self> {
         let encoder = pgpq::ArrowToPostgresBinaryEncoder::try_new(
-            &ArrowSchema::from_pyarrow_bound(pyschema).unwrap(),
+            &ArrowSchema::from_pyarrow_bound(pyschema)?,
         )
-        .unwrap();
+        .map_err(encode_error_to_py)?;
         Ok(Self {
             encoder,
             buf: BytesMut::with_capacity(BUFF_SIZE),
@@ -59,9 +59,9 @@ impl ArrowToPostgresBinaryEncoder {
             let encoder: pgpq::encoders::EncoderBuilder = py_builder.into();
             encoders.insert(name, encoder);
         }
-        let schema = &ArrowSchema::from_pyarrow_bound(py_schema).unwrap();
-        let encoder =
-            pgpq::ArrowToPostgresBinaryEncoder::try_new_with_encoders(schema, &encoders).unwrap();
+        let schema = &ArrowSchema::from_pyarrow_bound(py_schema)?;
+        let encoder = pgpq::ArrowToPostgresBinaryEncoder::try_new_with_encoders(schema, &encoders)
+            .map_err(encode_error_to_py)?;
         Ok(Self {
             encoder,
             buf: BytesMut::with_capacity(BUFF_SIZE),
@@ -71,19 +71,23 @@ impl ArrowToPostgresBinaryEncoder {
         self.encoder.write_header(&mut self.buf);
         PyBytes::new(py, &self.buf.split()[..]).into_any().unbind()
     }
-    fn write_batch(&mut self, py: Python, py_batch: &Bound<'_, PyAny>) -> PyObject {
-        let batch = &RecordBatch::from_pyarrow_bound(py_batch).unwrap();
-        self.encoder.write_batch(batch, &mut self.buf).unwrap();
+    fn write_batch(&mut self, py: Python, py_batch: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        let batch = &RecordBatch::from_pyarrow_bound(py_batch)?;
+        self.encoder
+            .write_batch(batch, &mut self.buf)
+            .map_err(encode_error_to_py)?;
 
         if self.buf.len() > BUFF_SIZE {
-            PyBytes::new(py, &self.buf.split()[..]).into_any().unbind()
+            Ok(PyBytes::new(py, &self.buf.split()[..]).into_any().unbind())
         } else {
-            PyBytes::new(py, &[][..]).into_any().unbind()
+            Ok(PyBytes::new(py, &[][..]).into_any().unbind())
         }
     }
-    fn finish(&mut self, py: Python) -> PyObject {
-        self.encoder.write_footer(&mut self.buf).unwrap();
-        PyBytes::new(py, &self.buf[..]).into_any().unbind()
+    fn finish(&mut self, py: Python) -> PyResult<PyObject> {
+        self.encoder
+            .write_footer(&mut self.buf)
+            .map_err(encode_error_to_py)?;
+        Ok(PyBytes::new(py, &self.buf[..]).into_any().unbind())
     }
     fn schema(&self) -> crate::pg_schema::PostgresSchema {
         self.encoder.schema().into()
@@ -91,6 +95,13 @@ impl ArrowToPostgresBinaryEncoder {
 }
 
 create_exception!(_pgpq, DecodeError, PyValueError);
+create_exception!(_pgpq, EncodeError, PyValueError);
+
+/// Converts an encoding error, such as a field whose Postgres type its Arrow
+/// type cannot be encoded as, to EncodeError.
+fn encode_error_to_py(error: ErrorKind) -> PyErr {
+    EncodeError::new_err(error.to_string())
+}
 
 /// Converts a decoding error to a Python exception. IO errors become OSError,
 /// and everything else becomes DecodeError.
@@ -209,6 +220,7 @@ fn _pgpq(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PostgresBinaryToArrowReader>()?;
     m.add_class::<PostgresBinaryFileDecoder>()?;
     m.add("DecodeError", py.get_type::<DecodeError>())?;
+    m.add("EncodeError", py.get_type::<EncodeError>())?;
     m.add("DEFAULT_BATCH_SIZE", pgpq::DEFAULT_BATCH_SIZE)?;
     m.add_class::<crate::encoders::Int8EncoderBuilder>()?;
     m.add_class::<crate::encoders::ListEncoderBuilder>()?;
@@ -249,6 +261,7 @@ fn _pgpq(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::pg_schema::Int2>()?;
     m.add_class::<crate::pg_schema::Int4>()?;
     m.add_class::<crate::pg_schema::Char>()?;
+    m.add_class::<crate::pg_schema::Varchar>()?;
     m.add_class::<crate::pg_schema::Text>()?;
     m.add_class::<crate::pg_schema::Json>()?;
     m.add_class::<crate::pg_schema::Jsonb>()?;

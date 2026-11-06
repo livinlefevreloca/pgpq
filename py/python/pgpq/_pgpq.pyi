@@ -21,6 +21,9 @@ class Int4:
 class Char:
     def ddl(self) -> str | None: ...
 
+class Varchar:
+    def ddl(self) -> str | None: ...
+
 class Text:
     def ddl(self) -> str | None: ...
 
@@ -82,6 +85,7 @@ PostgresType = Union[
     Float4,
     Float8,
     Char,
+    Varchar,
     Text,
     Json,
     Jsonb,
@@ -97,6 +101,7 @@ PostgresType = Union[
 DEFAULT_BATCH_SIZE: int
 
 class DecodeError(ValueError): ...
+class EncodeError(ValueError): ...
 
 class PostgresBinaryToArrowReader:
     def __init__(self, schema: PostgresSchema, batch_size: int = ...) -> None: ...
