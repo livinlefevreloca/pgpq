@@ -45,7 +45,9 @@ pub enum ErrorKind {
     #[error("Error decoding column {name}: {reason}")]
     Decode { reason: String, name: String },
     #[error("Got invalid binary file header {bytes:?}")]
-    InvalidBinaryHeader { bytes: [u8; 11] },
+    InvalidBinaryHeader {
+        bytes: [u8; crate::HEADER_MAGIC_LEN],
+    },
     #[error("Reached EOF in the middle of a tuple. partial tuple: {remaining_bytes:?}")]
     IncompleteDecode { remaining_bytes: Vec<u8> },
     #[error("The stream ended without the COPY trailer")]
