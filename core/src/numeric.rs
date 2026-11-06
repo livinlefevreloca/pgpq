@@ -49,8 +49,10 @@ pub(crate) fn numeric_to_string(data: &[u8]) -> Result<String, ErrorKind> {
         )));
     }
     let digits: Vec<i16> = data[HEADER_LEN..]
-        .chunks_exact(2)
-        .map(|c| i16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_be_bytes(*c))
         .collect();
     if digits.iter().any(|d| !(0..NBASE).contains(d)) {
         return Err(decode_error("a digit is outside 0 to 9999"));
