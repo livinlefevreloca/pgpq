@@ -11,8 +11,6 @@ use crate::error::ErrorKind;
 const DEC_DIGITS: usize = 4;
 const NBASE: i16 = 10000;
 
-const HEADER_LEN: usize = 8;
-
 const SIGN_POS: u16 = 0x0000;
 const SIGN_NEG: u16 = 0x4000;
 const SIGN_NAN: u16 = 0xC000;
@@ -23,18 +21,57 @@ const SIGN_NINF: u16 = 0xF000;
 const MAX_DSCALE: usize = 0x3FFF;
 const MAX_WEIGHT: i64 = i16::MAX as i64;
 
+/// The four 16-bit fields at the start of every numeric value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NumericHeader {
+    /// How many base-10000 digits follow the header.
+    ndigits: u16,
+    /// The power of 10000 of the first digit.
+    weight: i16,
+    /// SIGN_POS or SIGN_NEG, or SIGN_NAN, SIGN_PINF or SIGN_NINF for a value
+    /// with no digits.
+    sign: u16,
+    /// How many decimal digits are shown after the point.
+    dscale: u16,
+}
+
+impl NumericHeader {
+    const LEN: usize = 8;
+
+    /// The header of NaN or an infinity, which has no digits.
+    fn special(sign: u16) -> Self {
+        Self {
+            ndigits: 0,
+            weight: 0,
+            sign,
+            dscale: 0,
+        }
+    }
+
+    fn decode(data: &[u8]) -> Result<Self, ErrorKind> {
+        if data.len() < Self::LEN {
+            return Err(decode_error("the value is shorter than its header"));
+        }
+        Ok(Self {
+            ndigits: read_u16(data, 0),
+            weight: read_u16(data, 2) as i16,
+            sign: read_u16(data, 4),
+            dscale: read_u16(data, 6),
+        })
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.ndigits.to_be_bytes());
+        out.extend_from_slice(&self.weight.to_be_bytes());
+        out.extend_from_slice(&self.sign.to_be_bytes());
+        out.extend_from_slice(&self.dscale.to_be_bytes());
+    }
+}
+
 /// Formats a numeric's binary value the way Postgres's numeric_out does.
 pub(crate) fn numeric_to_string(data: &[u8]) -> Result<String, ErrorKind> {
-    if data.len() < HEADER_LEN {
-        return Err(decode_error("the value is shorter than its header"));
-    }
-    let field = |i: usize| u16::from_be_bytes([data[i], data[i + 1]]);
-    let ndigits = field(0) as usize;
-    let weight = field(2) as i16 as i64;
-    let sign = field(4);
-    let dscale = field(6) as usize;
-
-    match sign {
+    let header = NumericHeader::decode(data)?;
+    match header.sign {
         SIGN_NAN => return Ok("NaN".to_string()),
         SIGN_PINF => return Ok("Infinity".to_string()),
         SIGN_NINF => return Ok("-Infinity".to_string()),
@@ -42,13 +79,17 @@ pub(crate) fn numeric_to_string(data: &[u8]) -> Result<String, ErrorKind> {
         other => return Err(decode_error(&format!("unknown sign {other:#06x}"))),
     }
 
-    if data.len() != HEADER_LEN + 2 * ndigits {
+    let ndigits = header.ndigits as usize;
+    let dscale = header.dscale as usize;
+    if data.len() != NumericHeader::LEN + 2 * ndigits {
         return Err(decode_error(&format!(
             "{ndigits} digits do not fit in {} bytes",
             data.len()
         )));
     }
-    let digits: Vec<i16> = data[HEADER_LEN..]
+    // as_chunks splits the slice into 2-byte arrays (.0) and the bytes left
+    // over (.1). The length check above means nothing is left over.
+    let digits: Vec<i16> = data[NumericHeader::LEN..]
         .as_chunks::<2>()
         .0
         .iter()
@@ -57,26 +98,20 @@ pub(crate) fn numeric_to_string(data: &[u8]) -> Result<String, ErrorKind> {
     if digits.iter().any(|d| !(0..NBASE).contains(d)) {
         return Err(decode_error("a digit is outside 0 to 9999"));
     }
-    // The digit at position i has weight `weight - i`. Digits not stored are 0.
-    let digit_at = |w: i64| -> i16 {
-        let i = weight - w;
-        if i >= 0 && (i as usize) < ndigits {
-            digits[i as usize]
-        } else {
-            0
-        }
-    };
 
     let mut out = String::with_capacity(DEC_DIGITS * (ndigits + 2) + dscale + 2);
-    if sign == SIGN_NEG {
+    if header.sign == SIGN_NEG {
         out.push('-');
     }
 
+    let weight = i64::from(header.weight);
     if weight < 0 {
         out.push('0');
     } else {
+        // The integer part, from the digit of weight `weight` down to the
+        // digit of weight 0. `(0..=weight).rev()` counts down and includes 0.
         for w in (0..=weight).rev() {
-            let group = format!("{:04}", digit_at(w));
+            let group = format!("{:04}", digit_with_weight(&header, &digits, w));
             if w == weight {
                 // The first group has no leading zeros, though 0 stays "0".
                 let trimmed = group.trim_start_matches('0');
@@ -89,10 +124,12 @@ pub(crate) fn numeric_to_string(data: &[u8]) -> Result<String, ErrorKind> {
 
     if dscale > 0 {
         out.push('.');
+        // Fractional digits have negative weights: -1 for the first four
+        // decimal places, -2 for the next four, and so on.
         let mut fraction = String::with_capacity(dscale + DEC_DIGITS);
         let mut w = -1;
         while fraction.len() < dscale {
-            fraction.push_str(&format!("{:04}", digit_at(w)));
+            fraction.push_str(&format!("{:04}", digit_with_weight(&header, &digits, w)));
             w -= 1;
         }
         out.push_str(&fraction[..dscale]);
@@ -114,7 +151,7 @@ pub(crate) fn string_to_numeric(text: &str, out: &mut Vec<u8>) -> Result<(), Str
         _ => None,
     };
     if let Some(sign) = special {
-        write_header(out, 0, 0, sign, 0);
+        NumericHeader::special(sign).encode(out);
         return Ok(());
     }
 
@@ -183,7 +220,13 @@ pub(crate) fn string_to_numeric(text: &str, out: &mut Vec<u8>) -> Result<(), Str
 
     let Some(&(weight, _)) = groups.first() else {
         // Zero is positive with no digits.
-        write_header(out, 0, 0, SIGN_POS, dscale as u16);
+        let zero = NumericHeader {
+            ndigits: 0,
+            weight: 0,
+            sign: SIGN_POS,
+            dscale: dscale as u16,
+        };
+        zero.encode(out);
         return Ok(());
     };
     if weight > MAX_WEIGHT {
@@ -202,19 +245,32 @@ pub(crate) fn string_to_numeric(text: &str, out: &mut Vec<u8>) -> Result<(), Str
         stored[(weight - w) as usize] = v;
     }
 
-    let sign = if negative { SIGN_NEG } else { SIGN_POS };
-    write_header(out, ndigits as u16, weight as i16, sign, dscale as u16);
+    let header = NumericHeader {
+        ndigits: ndigits as u16,
+        weight: weight as i16,
+        sign: if negative { SIGN_NEG } else { SIGN_POS },
+        dscale: dscale as u16,
+    };
+    header.encode(out);
     for d in stored {
         out.extend_from_slice(&d.to_be_bytes());
     }
     Ok(())
 }
 
-fn write_header(out: &mut Vec<u8>, ndigits: u16, weight: i16, sign: u16, dscale: u16) {
-    out.extend_from_slice(&ndigits.to_be_bytes());
-    out.extend_from_slice(&weight.to_be_bytes());
-    out.extend_from_slice(&sign.to_be_bytes());
-    out.extend_from_slice(&dscale.to_be_bytes());
+/// The base-10000 digit of weight w. The first stored digit has the header's
+/// weight and each later one is one less. Digits not stored are 0.
+fn digit_with_weight(header: &NumericHeader, digits: &[i16], w: i64) -> i16 {
+    let index = i64::from(header.weight) - w;
+    if index >= 0 && (index as usize) < digits.len() {
+        digits[index as usize]
+    } else {
+        0
+    }
+}
+
+fn read_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([data[offset], data[offset + 1]])
 }
 
 fn decode_error(reason: &str) -> ErrorKind {

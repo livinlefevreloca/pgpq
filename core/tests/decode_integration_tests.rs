@@ -1,9 +1,8 @@
-use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch};
+use arrow::compute::cast;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ipc::reader::FileReader;
 use arrow_schema::{DataType, Field, Schema};
 use pgpq::error::ErrorKind;
-use pgpq::pg_schema::PG_TYPE_METADATA_KEY;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -25,32 +24,39 @@ fn read_arrow_file(path: PathBuf) -> Vec<RecordBatch> {
     reader.collect::<Result<Vec<_>, _>>().unwrap()
 }
 
-/// Removes the Postgres type metadata the decoder adds, since the expected
-/// Arrow files were written without it.
-fn without_pg_metadata(batch: &RecordBatch) -> RecordBatch {
+/// Adds the Postgres types the decoder writes to an expected batch. The Arrow
+/// files carry no metadata because they are also the encoder tests' inputs,
+/// and those tests check that the encoder infers types without it.
+fn with_pg_metadata(batch: &RecordBatch, schema: &PostgresSchema) -> RecordBatch {
     let mut fields = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
-    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        let column: ArrayRef = match field.data_type() {
-            DataType::List(element) => {
-                let list = column.as_list::<i32>();
-                let element = element.as_ref().clone().with_metadata(Default::default());
-                Arc::new(ListArray::new(
-                    Arc::new(element),
-                    list.offsets().clone(),
-                    list.values().clone(),
-                    list.nulls().cloned(),
-                ))
-            }
-            _ => column.clone(),
+    let expected = batch.schema();
+    for ((field, column), (name, pg_column)) in expected
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .zip(schema.iter())
+    {
+        let decoded = pg_column.to_field(name);
+        // A list's element field carries its own type, so the list's data type
+        // changes too, and the column is cast to it.
+        let data_type = match (field.data_type(), decoded.data_type()) {
+            (DataType::List(element), DataType::List(decoded_element)) => DataType::List(Arc::new(
+                element
+                    .as_ref()
+                    .clone()
+                    .with_metadata(decoded_element.metadata().clone()),
+            )),
+            (data_type, _) => data_type.clone(),
         };
-        let field = Field::new(
-            field.name(),
-            column.data_type().clone(),
-            field.is_nullable(),
+        columns.push(cast(column, &data_type).unwrap());
+        fields.push(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(data_type)
+                .with_metadata(decoded.metadata().clone()),
         );
-        fields.push(field);
-        columns.push(column);
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
 }
@@ -72,16 +78,6 @@ fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
         PostgresBinaryToArrowReader::new(schema.clone(), reader, READ_CHUNK_SIZE).unwrap();
     decoder.read_header()?;
     let batches = decoder.decode_batches()?;
-
-    for batch in &batches {
-        for (field, (_, column)) in batch.schema().fields().iter().zip(schema.iter()) {
-            assert_eq!(
-                field.metadata().get(PG_TYPE_METADATA_KEY),
-                column.data_type.typname().as_ref(),
-            );
-        }
-    }
-    let batches = batches.iter().map(without_pg_metadata).collect::<Vec<_>>();
 
     let mut expected_batches = read_arrow_file(arrow_path);
 
@@ -129,6 +125,11 @@ fn run_test_case(case: &str, timezone: String) -> Result<(), ErrorKind> {
             })
             .collect::<Vec<_>>();
     }
+
+    let expected_batches = expected_batches
+        .iter()
+        .map(|batch| with_pg_metadata(batch, &schema))
+        .collect::<Vec<_>>();
 
     assert_eq!(
         batches.iter().map(|b| b.num_rows()).sum::<usize>(),
