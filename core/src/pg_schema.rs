@@ -344,15 +344,6 @@ impl PostgresSchema {
         Ok(schema)
     }
 
-    pub fn nullify_columns(mut self, columns: &[String]) -> Self {
-        for (name, col) in self.columns.iter_mut() {
-            if columns.contains(name) {
-                col.data_type = PostgresType::Null;
-            }
-        }
-        self
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &(String, Column)> {
         self.columns.iter()
     }

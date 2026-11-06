@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator, List, Tuple
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 import pgpq
@@ -254,11 +255,26 @@ def test_arrow_schema_matches_batches(copy_bytes: bytes) -> None:
 
     batches = decoder.write(copy_bytes)
 
-    # With one batch covering every row, no column is all null, so the batch
-    # keeps the declared schema.
     assert len(batches) == 1
     assert batches[0].schema == decoder.arrow_schema
     assert decoder.arrow_schema.field("created_tz").type == pa.timestamp("us", tz="UTC")
+
+
+def test_all_null_batches_write_to_one_parquet_file(
+    tmp_path: Path, copy_bytes: bytes, expected_rows: List[Tuple[Any, ...]]
+) -> None:
+    # With one row per batch, every seventh batch is null in every nullable column.
+    decoder = pgpq.PostgresBinaryToArrowReader(SCHEMA, batch_size=1)
+    batches = decoder.write(copy_bytes)
+    decoder.finish()
+
+    path = tmp_path / "decoded.parquet"
+    with pq.ParquetWriter(path, decoder.arrow_schema) as writer:
+        for batch in batches:
+            assert batch.schema == decoder.arrow_schema
+            writer.write_batch(batch)
+
+    assert batch_rows(pq.read_table(path).to_batches()) == expected_rows
 
 
 def test_truncated_stream_raises(copy_bytes: bytes) -> None:

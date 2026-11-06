@@ -4,10 +4,10 @@ use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow::compute::concat;
 use arrow_array::builder::GenericByteBuilder;
 use arrow_array::types::GenericBinaryType;
-use arrow_array::{self, new_null_array, Array, ArrayRef};
+use arrow_array::{self, new_empty_array, Array, ArrayRef};
 use arrow_array::{
     BooleanArray, Date32Array, DurationMicrosecondArray, Float32Array, Float64Array,
-    GenericListArray, GenericStringArray, Int16Array, Int32Array, Int64Array, NullArray,
+    GenericListArray, GenericStringArray, Int16Array, Int32Array, Int64Array,
     Time64MicrosecondArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, FieldRef};
@@ -23,7 +23,6 @@ pub(crate) trait Decoder {
     fn decode(&mut self, buf: &mut BufferView) -> Result<(), ErrorKind>;
     fn finish(&mut self, column_len: usize) -> ArrayRef;
     fn name(&self) -> String;
-    fn is_null(&self) -> bool;
 }
 
 macro_rules! impl_decode {
@@ -55,17 +54,10 @@ macro_rules! impl_decode {
 
             fn finish(&mut self, column_len: usize) -> ArrayRef {
                 self.arr.resize(column_len, None);
-                // Taking the values resets the decoder for the next batch, null or not.
+                // Taking the values resets the decoder for the next batch.
                 let data = std::mem::take(&mut self.arr);
-                if data.iter().all(|v| v.is_none()) {
-                    return Arc::new(NullArray::new(data.len())) as ArrayRef;
-                }
                 let array = Arc::new($array_kind::from(data));
                 array as ArrayRef
-            }
-
-            fn is_null(&self) -> bool {
-                self.arr.iter().all(|v| v.is_none())
             }
         }
     };
@@ -115,17 +107,10 @@ macro_rules! impl_decode_fallible {
 
             fn finish(&mut self, column_len: usize) -> ArrayRef {
                 self.arr.resize(column_len, None);
-                // Taking the values resets the decoder for the next batch, null or not.
+                // Taking the values resets the decoder for the next batch.
                 let data = std::mem::take(&mut self.arr);
-                if data.iter().all(|v| v.is_none()) {
-                    return Arc::new(NullArray::new(data.len())) as ArrayRef;
-                }
                 let array = Arc::new($array_kind::from(data));
                 array as ArrayRef
-            }
-
-            fn is_null(&self) -> bool {
-                self.arr.iter().all(|v| v.is_none())
             }
         }
     };
@@ -180,17 +165,10 @@ macro_rules! impl_decode_variable_size {
 
             fn finish(&mut self, column_len: usize) -> ArrayRef {
                 self.arr.resize(column_len, None);
-                // Taking the values resets the decoder for the next batch, null or not.
+                // Taking the values resets the decoder for the next batch.
                 let data = std::mem::take(&mut self.arr);
-                if data.iter().all(|v| v.is_none()) {
-                    return Arc::new(NullArray::new(data.len())) as ArrayRef;
-                }
                 let array = Arc::new($array_kind::<$offset_size>::from(data));
                 array as ArrayRef
-            }
-
-            fn is_null(&self) -> bool {
-                self.arr.iter().all(|v| v.is_none())
             }
         }
     };
@@ -308,19 +286,12 @@ impl Decoder for TimestampTzMicrosecondDecoder {
 
     fn finish(&mut self, column_len: usize) -> ArrayRef {
         self.arr.resize(column_len, None);
-        // Taking the values resets the decoder for the next batch, null or not.
+        // Taking the values resets the decoder for the next batch.
         let data = std::mem::take(&mut self.arr);
-        if data.iter().all(|v| v.is_none()) {
-            return Arc::new(NullArray::new(data.len())) as ArrayRef;
-        }
         let array = Arc::new(
             TimestampMicrosecondArray::from(data).with_timezone(self.timezone.to_string()),
         );
         array as ArrayRef
-    }
-
-    fn is_null(&self) -> bool {
-        self.arr.iter().all(|v| v.is_none())
     }
 }
 
@@ -460,11 +431,8 @@ impl Decoder for BinaryDecoder {
 
     fn finish(&mut self, column_len: usize) -> ArrayRef {
         self.arr.resize(column_len, None);
-        // Taking the values resets the decoder for the next batch, null or not.
+        // Taking the values resets the decoder for the next batch.
         let data = std::mem::take(&mut self.arr);
-        if data.iter().all(|v| v.is_none()) {
-            return Arc::new(NullArray::new(data.len())) as ArrayRef;
-        }
         let mut builder: GenericByteBuilder<GenericBinaryType<i32>> = GenericByteBuilder::new();
         for v in data {
             match v {
@@ -473,10 +441,6 @@ impl Decoder for BinaryDecoder {
             }
         }
         Arc::new(builder.finish()) as ArrayRef
-    }
-
-    fn is_null(&self) -> bool {
-        self.arr.iter().all(|v| v.is_none())
     }
 }
 
@@ -696,9 +660,6 @@ impl Decoder for ArrayDecoder {
 
     fn finish(&mut self, _column_len: usize) -> ArrayRef {
         let rows = std::mem::take(&mut self.arr);
-        if rows.iter().all(Option::is_none) {
-            return Arc::new(NullArray::new(rows.len())) as ArrayRef;
-        }
 
         let element_type = self.element_field.data_type();
         let mut offsets = vec![0i32];
@@ -712,13 +673,6 @@ impl Decoder for ArrayDecoder {
                     validity.push(false);
                 }
                 Some(array) => {
-                    // The inner decoder returns a NullArray when every element is
-                    // null, which must become a null array of the element type.
-                    let array = if array.data_type() == &DataType::Null {
-                        new_null_array(element_type, array.len())
-                    } else {
-                        array
-                    };
                     offsets.push(end + array.len() as i32);
                     validity.push(true);
                     elements.push(array);
@@ -726,8 +680,14 @@ impl Decoder for ArrayDecoder {
             }
         }
 
-        let element_refs: Vec<&dyn Array> = elements.iter().map(|a| a.as_ref()).collect();
-        let values = concat(&element_refs).unwrap();
+        // concat needs at least one array, and a batch whose rows are all null
+        // or empty has none.
+        let values = if elements.is_empty() {
+            new_empty_array(element_type)
+        } else {
+            let element_refs: Vec<&dyn Array> = elements.iter().map(|a| a.as_ref()).collect();
+            concat(&element_refs).unwrap()
+        };
 
         let nulls = if validity.iter().all(|valid| *valid) {
             None
@@ -741,10 +701,6 @@ impl Decoder for ArrayDecoder {
             values,
             nulls,
         )) as ArrayRef
-    }
-
-    fn is_null(&self) -> bool {
-        self.arr.iter().all(Option::is_none)
     }
 
     fn name(&self) -> String {
@@ -929,27 +885,6 @@ impl PostgresDecoder {
             PostgresDecoder::Binary(ref mut decoder) => decoder.finish(column_len),
             PostgresDecoder::Jsonb(ref mut decoder) => decoder.finish(column_len),
             PostgresDecoder::List(ref mut decoder) => decoder.finish(column_len),
-        }
-    }
-
-    pub(crate) fn is_null(&self) -> bool {
-        match *self {
-            PostgresDecoder::Boolean(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Int16(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Int32(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Int64(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Float32(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Float64(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Numeric(ref decoder) => decoder.is_null(),
-            PostgresDecoder::TimestampMicrosecond(ref decoder) => decoder.is_null(),
-            PostgresDecoder::TimestampTzMicrosecond(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Date32(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Time64Microsecond(ref decoder) => decoder.is_null(),
-            PostgresDecoder::DurationMicrosecond(ref decoder) => decoder.is_null(),
-            PostgresDecoder::String(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Binary(ref decoder) => decoder.is_null(),
-            PostgresDecoder::Jsonb(ref decoder) => decoder.is_null(),
-            PostgresDecoder::List(ref decoder) => decoder.is_null(),
         }
     }
 }

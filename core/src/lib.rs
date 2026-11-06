@@ -382,25 +382,13 @@ impl PostgresBinaryToArrowDecoder {
         let column_len = self.rows_in_batch;
         self.rows_in_batch = 0;
 
-        // An all-null column becomes a NullArray, so its field's type in this
-        // batch's schema must be Null as well.
-        let null_columns = self
-            .decoders
-            .iter()
-            .filter(|decoder| decoder.is_null())
-            .map(|decoder| decoder.name())
-            .collect::<Vec<String>>();
-
         let columns = self
             .decoders
             .iter_mut()
             .map(|decoder| decoder.finish(column_len))
             .collect();
 
-        Ok(RecordBatch::try_new(
-            self.schema.clone().nullify_columns(&null_columns).into(),
-            columns,
-        )?)
+        Ok(RecordBatch::try_new(self.schema.clone().into(), columns)?)
     }
 }
 

@@ -374,7 +374,7 @@ fn test_jsonb_skips_its_version_byte_at_every_split() {
 }
 
 #[test]
-fn test_a_batch_after_an_all_null_batch_keeps_its_values() {
+fn test_an_all_null_batch_keeps_the_declared_types() {
     let mut schema = schema();
     schema.columns[1].1.nullable = true;
     let mut decoder = PostgresBinaryToArrowDecoder::new(schema, 1).unwrap();
@@ -390,8 +390,66 @@ fn test_a_batch_after_an_all_null_batch_keeps_its_values() {
     stream.extend([0xff, 0xff]); // trailer
     let batches = decoder.write(&stream).unwrap();
 
+    // A Parquet writer needs every batch of a file to share one schema.
     assert_eq!(batches.len(), 2);
-    assert_eq!(batches[0].column(1).data_type(), &DataType::Null);
-    assert_eq!(batches[0].column(1).len(), 1);
+    assert_eq!(batches[0].schema(), decoder.arrow_schema());
+    assert_eq!(batches[1].schema(), decoder.arrow_schema());
+    assert_eq!(batches[0].column(1).data_type(), &DataType::Utf8);
+    assert_eq!(batches[0].column(1).null_count(), 1);
     assert_eq!(as_rows(&batches[1]), vec![(2, "b".to_string())]);
+}
+
+#[test]
+fn test_an_all_null_list_batch_keeps_the_declared_types() {
+    let element = Column {
+        data_type: PostgresType::Int4,
+        nullable: true,
+    };
+    let schema = PostgresSchema {
+        columns: vec![(
+            "ids".to_string(),
+            Column {
+                data_type: PostgresType::List(("ids".to_string(), Box::new(element))),
+                nullable: true,
+            },
+        )],
+    };
+    // One row per batch, so each batch has a different kind of all-null list.
+    let mut decoder = PostgresBinaryToArrowDecoder::new(schema, 1).unwrap();
+
+    let mut rows = BytesMut::new();
+    // A null array.
+    rows.put_i16(1);
+    rows.put_i32(-1);
+    // An empty array: zero dimensions, no nulls, element OID.
+    rows.put_i16(1);
+    rows.put_i32(12);
+    rows.put_i32(0);
+    rows.put_i32(0);
+    rows.put_i32(23);
+    // An array with one null element: dimensions, has-nulls flag, element OID,
+    // dimension length, lower bound, then the element.
+    rows.put_i16(1);
+    rows.put_i32(24);
+    rows.put_i32(1);
+    rows.put_i32(1);
+    rows.put_i32(23);
+    rows.put_i32(1);
+    rows.put_i32(1);
+    rows.put_i32(-1);
+
+    let mut stream = header();
+    stream.extend(rows.to_vec());
+    stream.extend([0xff, 0xff]); // trailer
+    let batches = decoder.write(&stream).unwrap();
+
+    assert_eq!(batches.len(), 3);
+    for batch in &batches {
+        assert_eq!(batch.schema(), decoder.arrow_schema());
+    }
+    assert!(batches[0].column(0).is_null(0));
+    let elements = |i: usize| batches[i].column(0).to_data().child_data()[0].clone();
+    assert_eq!(elements(1).len(), 0);
+    assert_eq!(elements(2).len(), 1);
+    assert_eq!(elements(2).null_count(), 1);
 }
