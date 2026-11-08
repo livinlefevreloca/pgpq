@@ -374,13 +374,19 @@ NUMERIC_VALUES = [
     None,
 ]
 
+# numeric accepts Infinity and -Infinity from Postgres 14.
+NUMERIC_INFINITY_MIN_SERVER_VERSION = 140000
+
 
 def test_numeric_round_trips_through_postgres(dbconn: Connection) -> None:
     schema = PostgresSchema([("value", Column(True, Numeric()))])
+    values = NUMERIC_VALUES
+    if dbconn.info.server_version < NUMERIC_INFINITY_MIN_SERVER_VERSION:
+        values = [v for v in values if v not in ("Infinity", "-Infinity")]
     try:
         with dbconn.cursor() as cursor:
             cursor.execute("CREATE TEMP TABLE numeric_source (id int, value numeric)")
-            for i, value in enumerate(NUMERIC_VALUES):
+            for i, value in enumerate(values):
                 cursor.execute(
                     "INSERT INTO numeric_source VALUES (%s, %s::numeric)", (i, value)
                 )

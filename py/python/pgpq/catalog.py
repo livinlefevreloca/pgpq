@@ -26,6 +26,8 @@ JOIN pg_namespace type_schema ON type_schema.oid = t.typnamespace
 
 # Every column of every requested table in COPY order, keyed by the name the
 # caller passed. A name Postgres cannot resolve fails the cast to regclass.
+# COPY of a table leaves out generated columns, so the query does too.
+# attgenerated exists from Postgres 12, the oldest version this supports.
 TABLE_COLUMNS_QUERY = (
     """
 SELECT requested.name, a.attname, type_schema.nspname, t.typname, NOT a.attnotnull
@@ -34,7 +36,7 @@ JOIN pg_attribute a ON a.attrelid = requested.name::regclass
 """
     + DECODED_TYPE_JOIN.format(type_oid="a.atttypid")
     + """
-WHERE a.attnum > 0 AND NOT a.attisdropped
+WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
 ORDER BY requested.position, a.attnum
 """
 )

@@ -35,7 +35,8 @@ CREATE TABLE catalog_test.accounts (
     score catalog_test.positive,
     doc jsonb,
     tags text[],
-    opened timestamptz
+    opened timestamptz,
+    doubled int8 GENERATED ALWAYS AS (id * 2) STORED
 );
 ALTER TABLE catalog_test.accounts DROP COLUMN dropped;
 INSERT INTO catalog_test.accounts VALUES
@@ -97,9 +98,10 @@ def cursor(request: Any, dbconn: Connection, psycopg2_conn: Any, tables: None) -
     conn.rollback()
 
 
-def copy_out(dbconn: Connection, query: str) -> bytes:
+def copy_out(dbconn: Connection, source: str) -> bytes:
+    """Binary COPY output of source, a table name or a parenthesized query."""
     with dbconn.cursor() as cursor:
-        with cursor.copy(f"COPY ({query}) TO STDOUT WITH (FORMAT binary)") as copy:
+        with cursor.copy(f"COPY {source} TO STDOUT WITH (FORMAT binary)") as copy:
             return b"".join(bytes(chunk) for chunk in copy)
 
 
@@ -109,7 +111,8 @@ def test_schemas_for_tables(cursor: Any, dbconn: Connection) -> None:
     assert list(schemas) == ["catalog_test.accounts"]
     assert schemas["catalog_test.accounts"] == ACCOUNTS_SCHEMA
 
-    data = copy_out(dbconn, "SELECT * FROM catalog_test.accounts ORDER BY id")
+    # A table's COPY output leaves out the generated column, and so does its schema.
+    data = copy_out(dbconn, "catalog_test.accounts")
     batches = pgpq.decode_bytes(data, schemas["catalog_test.accounts"])
     rows = pa.Table.from_batches(batches).to_pylist()
     assert rows == ACCOUNTS_ROWS
@@ -150,7 +153,7 @@ def test_schema_for_query(cursor: Any, dbconn: Connection) -> None:
             ("label", Column(True, Text())),
         ]
     )
-    batches = pgpq.decode_bytes(copy_out(dbconn, query), schema)
+    batches = pgpq.decode_bytes(copy_out(dbconn, f"({query})"), schema)
     assert pa.Table.from_batches(batches).to_pylist() == [
         {"id": 1, "doubled": "3.00", "score": 3, "total": 2, "label": "100%"},
         {"id": 2, "doubled": "-4", "score": None, "total": 2, "label": "100%"},
@@ -177,8 +180,7 @@ def test_arrow_copy_writer_with_copy_expert(psycopg2_conn: Any, tables: None) ->
             schema["catalog_test.accounts"], batches.append, batch_size=1
         ) as writer:
             cursor.copy_expert(
-                "COPY (SELECT * FROM catalog_test.accounts ORDER BY id) "
-                "TO STDOUT WITH (FORMAT binary)",
+                "COPY catalog_test.accounts TO STDOUT WITH (FORMAT binary)",
                 writer,
             )
     psycopg2_conn.rollback()
@@ -192,7 +194,7 @@ def test_arrow_copy_writer_with_copy_expert(psycopg2_conn: Any, tables: None) ->
 def test_arrow_copy_writer_rejects_a_truncated_stream(
     dbconn: Connection, tables: None
 ) -> None:
-    data = copy_out(dbconn, "SELECT * FROM catalog_test.accounts")
+    data = copy_out(dbconn, "catalog_test.accounts")
     writer = pgpq.ArrowCopyWriter(ACCOUNTS_SCHEMA, lambda batch: None)
     writer.write(data[:-2])
 
