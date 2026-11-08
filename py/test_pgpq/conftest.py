@@ -19,3 +19,13 @@ def dbconn(postgres: Postgresql) -> Iterator[Connection]:
     print(postgres.url())
     with psycopg.connect(str(postgres.url())) as conn:
         yield conn
+
+
+@pytest.fixture(scope="session")
+def psycopg2_conn(postgres: Postgresql) -> Iterator[Any]:
+    """A psycopg2 connection, the driver albert-main's dump uses."""
+    import psycopg2
+
+    conn = psycopg2.connect(**postgres.dsn())
+    yield conn
+    conn.close()
